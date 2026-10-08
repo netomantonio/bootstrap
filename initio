@@ -44,7 +44,7 @@ repo_hashicorp() {
   curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$t" && [ -s "$t" ] || { echo "falha ao baixar chave HashiCorp; repo pulado"; rm -f "$t"; return 1; }
   gpg --dearmor < "$t" 2>/dev/null | S tee /usr/share/keyrings/hashicorp-archive-keyring.gpg >/dev/null; rm -f "$t"
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") main" | S tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
-  REPO_PKGS+=(vagrant)
+  return 0
 }
 repo_helm() {
   local id="DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" t; t=$(mktemp)
@@ -99,6 +99,43 @@ pos_bun() {  # bun via instalador oficial; ele acrescenta linhas nos rc: desfaz 
   curl -fsSL -o "$STATE/bun-install.sh" https://bun.sh/install && bash "$STATE/bun-install.sh" </dev/null; local rc=$?
   for f in .bashrc .zshrc .zshenv .profile .zprofile; do [ -f "$bk/$f" ] && cp -p "$bk/$f" "$H/$f"; done; rm -rf "$bk"
   return $rc
+}
+
+# ================= binarios avulsos por perfil (catalogo binarios.tsv; fontes oficiais) =================
+bin_ghrel() {  # $1 nome ; $2 "owner/repo|asset|binario-no-arquivo" ({tag} e {ver} sao substituidos pela ultima tag estavel)
+  local n="$1" repo asset bin tag ver t u f rc
+  IFS='|' read -r repo asset bin <<<"$2"; bin="${bin:-$n}"
+  tag=$(git ls-remote --tags --refs --sort=-v:refname "https://github.com/$repo.git" 2>/dev/null | awk '{sub("refs/tags/","",$2); print $2}' | grep -viE 'rc|alpha|beta|dev|nightly|pre|snapshot' | grep -E '^v?[0-9]+\.[0-9]+' | head -1)
+  [ -n "$tag" ] || { echo "sem tag estavel em $repo" >>"$LOG"; return 1; }
+  ver="${tag#v}"; asset="${asset//\{tag\}/$tag}"; asset="${asset//\{ver\}/$ver}"
+  t=$(mktemp -d); u="https://github.com/$repo/releases/download/$tag/$asset"
+  curl -fsSL "$u" -o "$t/$asset" >>"$LOG" 2>&1 || { echo "download falhou: $u" >>"$LOG"; rm -rf "$t"; return 1; }
+  case "$asset" in
+    *.tar.gz|*.tgz) tar -xzf "$t/$asset" -C "$t" >>"$LOG" 2>&1; f=$(find "$t" -type f -name "$bin" | head -1)
+      [ -n "$f" ] || { echo "binario $bin nao esta em $asset" >>"$LOG"; rm -rf "$t"; return 1; }; install -m 0755 "$f" "$H/.local/bin/$n"; rc=$?;;
+    *) install -m 0755 "$t/$asset" "$H/.local/bin/$n"; rc=$?;;
+  esac; rm -rf "$t"; return $rc
+}
+bin_gomod() {  # $1 nome ; $2 modulo@versao ; precisa de Go via goenv (instala se faltar)
+  local g="$H/.goenv/shims"
+  [ -x "$g/go" ] || { pos_go </dev/null >>"$LOG" 2>&1; GOENV_ROOT="$H/.goenv" "$H/.goenv/bin/goenv" rehash >>"$LOG" 2>&1; }
+  [ -x "$g/go" ] || { echo "go indisponivel via goenv (packages/goenv-versions.txt vazio? rode 'initio sync' na maquina original)" >>"$LOG"; return 1; }
+  GOENV_ROOT="$H/.goenv" PATH="$g:$H/.goenv/bin:$PATH" GOBIN="$H/go/bin" go install "$2" >>"$LOG" 2>&1
+}
+bin_kubectl() {  # fonte oficial dl.k8s.io (padrao da documentacao do Kubernetes)
+  local v t rc; v=$(curl -fsSL https://dl.k8s.io/release/stable.txt) && [ -n "$v" ] || return 1
+  t=$(mktemp); curl -fsSL "https://dl.k8s.io/release/$v/bin/linux/amd64/kubectl" -o "$t" >>"$LOG" 2>&1 && install -m 0755 "$t" "$H/.local/bin/kubectl"; rc=$?; rm -f "$t"; return $rc
+}
+binarios_perfil() {  # $1 = perfil
+  local T="$INITIO_HOME/binarios.tsv" p n m sp; [ -f "$T" ] || return 0; mkdir -p "$H/.local/bin"
+  while IFS=$'\t' read -r p n m sp; do
+    case "$p" in ""|\#*) continue;; esac; [ "$p" = "$1" ] || continue
+    { [ -x "$H/.local/bin/$n" ] || [ -x "$H/go/bin/$n" ] || command -v "$n" >/dev/null 2>&1; } && continue
+    case "$m" in
+      ghrel) bin_ghrel "$n" "$sp" </dev/null;; gomod) bin_gomod "$n" "$sp" </dev/null;; kubectl) bin_kubectl </dev/null;;
+      *) false;;
+    esac && ok "binario $n" || bad "binario $n"
+  done < "$T"
 }
 
 # ================= instalacao de um perfil (idempotente) =================
@@ -174,6 +211,7 @@ instalar_perfil() {
       done < "$PK2/$PIP_FILE"; ok "pip ($PIP_FILE: $pn novos, $pf falharam -> ~/initio-pip-falhou.txt)"
     fi
   fi
+  binarios_perfil "$p"
   [ -n "$POS" ] && { "$POS" >>"$LOG" 2>&1 && ok "config: $POS" || bad "config: $POS"; }
   grep -qx "$p" "$STATE/instalados" 2>/dev/null || echo "$p" >> "$STATE/instalados"
 }
@@ -259,7 +297,7 @@ extras_add() {  # $1 = array (APT|NPM|CARGO|PIPX) ; stdin = nomes novos
   [ $DRY = 1 ] && { echo "   [dry] novo: $arr += $novos"; return; }
   [ -f "$f" ] || printf 'DESC="Dependencias que apareceram no uso (detectadas pelo initio snapshot/sync)"\n' > "$f"
   if grep -q "^$arr=(" "$f"; then sed -i "s/^$arr=(\(.*\))$/$arr=(\1 $novos)/" "$f"; else echo "$arr=($novos)" >> "$f"; fi
-  echo "   novo em extras.conf: $arr += $novos"
+  echo "   novo em extras.conf: $arr += $novos   -> escolha o perfil: initio perfil move ${arr,,} <pacote> <perfil>   (perfis: initio list)"
 }
 cmd_snapshot() {
   command -v chezmoi >/dev/null || { echo "chezmoi nao instalado (initio restore)"; return 1; }
@@ -274,7 +312,7 @@ cmd_snapshot() {
   [ $DRY = 0 ] && chezmoi re-add >/dev/null 2>&1
   say "-- dependencias novas (fora dos perfis) -> extras.conf"
   local ign="$INITIO_HOME/ignore.txt"; touch "$ign"
-  local con; con="$(lista_conhecidos APT; grep -qs '^REPOS=(.*docker' "$INITIO_HOME"/perfis/*.conf && printf '%s\n' docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; grep -qs '^REPOS=(.*helm' "$INITIO_HOME"/perfis/*.conf && echo helm; grep -qs '^REPOS=(.*grafana' "$INITIO_HOME"/perfis/*.conf && echo grafana; grep -qs '^REPOS=(.*hashicorp' "$INITIO_HOME"/perfis/*.conf && echo vagrant)"
+  local con; con="$(lista_conhecidos APT; grep -qs '^REPOS=(.*docker' "$INITIO_HOME"/perfis/*.conf && printf '%s\n' docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; grep -qs '^REPOS=(.*helm' "$INITIO_HOME"/perfis/*.conf && echo helm; grep -qs '^REPOS=(.*grafana' "$INITIO_HOME"/perfis/*.conf && echo grafana; grep -qs '^REPOS=(.*hashicorp' "$INITIO_HOME"/perfis/*.conf && printf '%s\n' vagrant terraform vault consul)"
   dpkg-query -W -f='${Package} ${Priority}\n' $(apt-mark showmanual 2>/dev/null) 2>/dev/null | awk '$2!="required" && $2!="important"{print $1}' | grep -Ev '^(linux-|ubuntu-|snapd|lxd|cloud-|grub|wsl)' | sort -u \
     | comm -23 - <({ printf '%s\n' "$con"; cat "$ign"; } | sort -u) | extras_add APT
   if command -v npm >/dev/null && case "$(command -v npm)" in /mnt/*) false;; esac; then
@@ -303,7 +341,7 @@ cmd_snapshot() {
 self_install() {  # instala/atualiza a copia local (~/.local) a partir de onde o initio esta rodando
   local T="$H/.local/share/initio"; mkdir -p "$H/.local/bin" "$T/perfis"
   if [ "$INITIO_HOME" != "$T" ]; then
-    cp -f "$INITIO_HOME"/perfis/*.conf "$T/perfis/"; [ -f "$INITIO_HOME/ignore.txt" ] && cp -f "$INITIO_HOME/ignore.txt" "$T/"
+    cp -f "$INITIO_HOME"/perfis/*.conf "$T/perfis/"; [ -f "$INITIO_HOME/ignore.txt" ] && cp -f "$INITIO_HOME/ignore.txt" "$T/"; [ -f "$INITIO_HOME/binarios.tsv" ] && cp -f "$INITIO_HOME/binarios.tsv" "$T/"
     INITIO_HOME="$T"
   fi
   [ "$SELF" = "$H/.local/bin/initio" ] || { cp -f "$SELF" "$H/.local/bin/initio"; chmod +x "$H/.local/bin/initio"; }
@@ -317,13 +355,13 @@ cmd_sync() {
   say "2/5 capturando esta maquina"; cmd_snapshot
   [ $DRY = 1 ] && { echo "[dry] pararia aqui (nao publica nem instala)"; return 0; }
   say "3/5 publicando initio + perfis nos dotfiles"
-  chezmoi add "$H/.local/bin/initio" "$H"/.local/share/initio/perfis/*.conf "$H/.local/share/initio/ignore.txt" >/dev/null 2>&1
+  chezmoi add "$H/.local/bin/initio" "$H"/.local/share/initio/perfis/*.conf "$H/.local/share/initio/ignore.txt" "$H/.local/share/initio/binarios.tsv" >/dev/null 2>&1
   git -C "$SRC" add -A
   git -C "$SRC" commit -q -m "initio sync $(date +%F\ %H:%M) @$(hostname)" 2>/dev/null || echo "   nada novo para commitar"
   git -C "$SRC" push -q 2>&1 | tail -2
   say "4/5 aplicando"; chezmoi apply >/dev/null 2>&1
   say "5/5 instalando o que falta nos perfis ja instalados$([ $UPGRADE = 1 ] && echo ' (+upgrade)')"
-  PERFIS=(); [ -s "$STATE/instalados" ] && while read -r p; do PERFIS+=("$p"); done < "$STATE/instalados"
+  PERFIS=(); [ -s "$STATE/instalados" ] && while read -r p; do [ "$p" = extras ] || PERFIS+=("$p"); done < "$STATE/instalados"
   [ -f "$INITIO_HOME/perfis/extras.conf" ] && ! printf '%s\n' "${PERFIS[@]:-}" | grep -qx extras && PERFIS+=(extras)
   [ ${#PERFIS[@]} -gt 0 ] || PERFIS=(base)
   instalar_lista
@@ -365,9 +403,9 @@ cmd_publicar_boot() {
   [ -d "$d/.git" ] || gh repo clone "$R" "$d" -- -q
   git -C "$d" pull -q --rebase 2>/dev/null
   mkdir -p "$d/perfis"; cp -f "$INITIO_HOME"/perfis/*.conf "$d/perfis/"; cp -f "$SELF" "$d/initio"
-  for f in ignore.txt install.sh worker.js; do [ -f "$INITIO_HOME/$f" ] && cp -f "$INITIO_HOME/$f" "$d/$f"; done
+  for f in ignore.txt binarios.tsv install.sh worker.js; do [ -f "$INITIO_HOME/$f" ] && cp -f "$INITIO_HOME/$f" "$d/$f"; done
   # trava: nada que pareca segredo vai para um repo publico
-  local achou; achou=$(grep -rIEn "$SEGRE" "$d" --exclude-dir=.git --exclude=initio 2>/dev/null | grep -v 'getent passwd')
+  local achou; achou=$(grep -rIEn "$SEGRE" "$d" --exclude-dir=.git --exclude=initio --exclude=binarios.tsv 2>/dev/null | grep -v 'getent passwd')
   [ -z "$achou" ] || { echo "RECUSADO: possivel segredo em: $achou"; return 1; }
   git -C "$d" add -A; git -C "$d" commit -q -m "bootstrap $(date +%F\ %H:%M)" 2>/dev/null || echo "nada novo"
   git -C "$d" push -q && echo "publicado: https://github.com/$R"
@@ -447,7 +485,15 @@ cmd_doctor() {
 
 # ================= perfil add =================
 cmd_perfil() {
-  [ "${1:-}" = add ] && [ $# -ge 4 ] || { echo "uso: initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>"; return 1; }
+  if [ "${1:-}" = move ]; then  # initio perfil move <apt|npm|pip|cargo|pipx> <pacote> <perfil-destino>: tira de extras.conf e poe no perfil
+    [ $# -eq 4 ] || { echo "uso: initio perfil move <apt|npm|pip|cargo|pipx> <pacote> <perfil-destino>"; return 1; }
+    local t="${2^^}" pkg="$3" dst="$4" ex="$INITIO_HOME/perfis/extras.conf" novo
+    [ -f "$INITIO_HOME/perfis/$dst.conf" ] || { echo "perfil inexistente: $dst (initio list)"; return 1; }
+    novo=$( ( APT=(); NPM=(); PIP=(); CARGO=(); PIPX=(); . "$ex"; eval "for x in \"\${$t[@]:-}\"; do [ \"\$x\" = \"\$pkg\" ] || printf '%s ' \"\$x\"; done" ) ); novo="${novo% }"
+    if [ -n "$novo" ]; then sed -i "s|^$t=(.*)\$|$t=($novo)|" "$ex"; else sed -i "/^$t=(/d" "$ex"; fi
+    cmd_perfil add "$dst" "$2" "$pkg"; return
+  fi
+  [ "${1:-}" = add ] && [ $# -ge 4 ] || { echo "uso: initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>  |  initio perfil move <tipo> <pacote> <perfil>"; return 1; }
   local p="$2" t="${3^^}" pkg="$4" f="$INITIO_HOME/perfis/$2.conf"; [ -f "$f" ] || { echo "perfil inexistente: $p"; return 1; }
   case "$t" in APT|NPM|PIP|CARGO|PIPX) ;; *) echo "tipo invalido: $3"; return 1;; esac
   if grep -q "^$t=(" "$f"; then sed -i "s/^$t=(\(.*\))$/$t=(\1 $pkg)/" "$f"; else echo "$t=($pkg)" >> "$f"; fi
@@ -489,7 +535,7 @@ case "$cmd" in
   portar) cmd_portar;;
   doctor) cmd_doctor;;
   perfil) cmd_perfil "$@";;
-  all) for f in "$INITIO_HOME"/perfis/*.conf; do PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;
+  all) for f in "$INITIO_HOME"/perfis/*.conf; do [ "$(basename "$f" .conf)" = extras ] || PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;
   bootstrap) PERFIS=(base); instalar_lista;;
   *) PERFIS=("$cmd" "$@"); instalar_lista;;
 esac
