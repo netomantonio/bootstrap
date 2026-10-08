@@ -18,7 +18,7 @@ ok()  { RES+=("OK     $1"); }
 bad() { local m; m=$(tail -n 40 "$LOG" 2>/dev/null | grep -iE 'error|erro|fail|not found|could not|unable|denied|conflict' | tail -n 1 | cut -c1-150); RES+=("FALHOU $1${m:+  <- $m}"); }
 S()   { sudo -n -E "$@"; }
 czsrc() { chezmoi source-path 2>/dev/null || echo "$H/.local/share/chezmoi"; }
-cofre_dir() { local d; for d in /mnt/c/Users/*/OneDrive*/Documentos/Credenciais\ e\ Certificados/_cofre; do [ -d "$d" ] && { echo "$d"; return; }; done; }
+cofre_dir() { local d; [ "${INITIO_SEM_ONEDRIVE:-0}" = 1 ] && return 0; for d in /mnt/c/Users/*/OneDrive*/Documentos/Credenciais\ e\ Certificados/_cofre; do [ -d "$d" ] && { echo "$d"; return; }; done; }
 
 # ================= base de sudo (uma senha, depois sozinho) =================
 sudo_prep() {
@@ -61,6 +61,16 @@ repo_grafana() {
   REPO_PKGS+=(grafana)
 }
 
+# chaves de repos apt ja existentes na maquina podem ficar velhas (o fornecedor troca a chave de assinatura): renova do dominio oficial
+renovar_chaves() {
+  local t
+  if [ -f /etc/apt/sources.list.d/github-cli.list ]; then t=$(mktemp)
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o "$t" && [ -s "$t" ] && S install -m 0644 "$t" /usr/share/keyrings/githubcli-archive-keyring.gpg >>"$LOG" 2>&1 && echo "chave gh renovada" >>"$LOG"; rm -f "$t"; fi
+  if [ -f /etc/apt/sources.list.d/hashicorp.list ]; then t=$(mktemp)
+    curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$t" && [ -s "$t" ] && gpg --dearmor < "$t" 2>/dev/null | S tee /usr/share/keyrings/hashicorp-archive-keyring.gpg >/dev/null && echo "chave hashicorp renovada" >>"$LOG"; rm -f "$t"; fi
+  return 0
+}
+
 # ================= pos-instalacao (configuracao das ferramentas) =================
 pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaurado
   [ "$(basename "${SHELL:-}")" = zsh ] || S chsh -s "$(command -v zsh)" "$USER"
@@ -68,6 +78,17 @@ pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaura
 pos_devops() {  # docker: grupo + servico (so com systemd ativo)
   S usermod -aG docker "$USER"
   if [ -d /run/systemd/system ]; then S systemctl enable --now docker; else echo "systemd inativo: docker so sobe apos reiniciar a distro (wsl -t <nome>)"; fi
+}
+
+pos_go() {  # goenv (clone) + versoes do Go registradas em packages/goenv-versions.txt
+  local P="$(czsrc)/packages" v
+  [ -d "$H/.goenv" ] || git clone --depth 1 https://github.com/go-nv/goenv.git "$H/.goenv" || return 1
+  [ -f "$P/goenv-versions.txt" ] && while read -r v; do [ -n "$v" ] || continue; [ -d "$H/.goenv/versions/$v" ] || GOENV_ROOT="$H/.goenv" "$H/.goenv/bin/goenv" install -s "$v" </dev/null || return 1; done < "$P/goenv-versions.txt"
+  [ -s "$P/goenv-global.txt" ] && cp -f "$P/goenv-global.txt" "$H/.goenv/version"
+  return 0
+}
+pos_bun() {  # bun via instalador oficial
+  [ -x "$H/.bun/bin/bun" ] || { curl -fsSL -o "$STATE/bun-install.sh" https://bun.sh/install && bash "$STATE/bun-install.sh" </dev/null; }
 }
 
 # ================= instalacao de um perfil (idempotente) =================
@@ -158,7 +179,7 @@ pergunta_conda() {
   fi
 }
 instalar_lista() {
-  [ $DRY = 0 ] && sudo_prep   # todas as perguntas juntas no inicio: sudo, depois termos do conda; depois roda sozinho
+  [ $DRY = 0 ] && { sudo_prep; renovar_chaves; }   # todas as perguntas juntas no inicio: sudo, depois termos do conda; depois roda sozinho
   pergunta_conda
   local _o=(base) _x; for _x in "${PERFIS[@]}"; do [ "$_x" = base ] || printf '%s\n' "${_o[@]}" | grep -qx "$_x" || _o+=("$_x"); done; PERFIS=("${_o[@]}")
   local p; for p in "${PERFIS[@]}"; do instalar_perfil "$p"; done
@@ -261,9 +282,7 @@ cmd_snapshot() {
     u=$(git -C "$r" remote get-url origin 2>/dev/null | sed -E 's#https://[^@]*@#https://#'); [ -n "$u" ] || continue
     b=$(git -C "$r" branch --show-current 2>/dev/null); printf '%s\t%s\t%s\n' "${r#$H/}" "$u" "${b:-main}"; done > "$SRC/repos.tsv.new" && mv "$SRC/repos.tsv.new" "$SRC/repos.tsv"
   say "   repos.tsv: $(wc -l < "$SRC/repos.tsv") repos"
-  # ferramentas nao automatizadas (aviso honesto)
-  [ -d "$H/.goenv" ] && echo "   aviso: goenv encontrado; initio ainda NAO instala goenv/go (instale manualmente)"
-  [ -d "$H/.bun" ] && echo "   aviso: bun encontrado; initio ainda NAO instala bun"
+  [ -d "$H/.goenv/versions" ] && { ls -1 "$H/.goenv/versions" > "$PK/goenv-versions.txt" 2>/dev/null; cp -f "$H/.goenv/version" "$PK/goenv-global.txt" 2>/dev/null; true; }
 }
 
 # ================= sync: capturar -> publicar -> puxar -> aplicar -> instalar o que falta =================
@@ -334,10 +353,28 @@ cmd_publicar_boot() {
   mkdir -p "$d/perfis"; cp -f "$INITIO_HOME"/perfis/*.conf "$d/perfis/"; cp -f "$SELF" "$d/initio"
   for f in ignore.txt install.sh worker.js; do [ -f "$INITIO_HOME/$f" ] && cp -f "$INITIO_HOME/$f" "$d/$f"; done
   # trava: nada que pareca segredo vai para um repo publico
-  local achou; achou=$(grep -rIEl "$SEGRE" "$d" --exclude-dir=.git --exclude=initio 2>/dev/null)
+  local achou; achou=$(grep -rIEn "$SEGRE" "$d" --exclude-dir=.git --exclude=initio 2>/dev/null | grep -v 'getent passwd')
   [ -z "$achou" ] || { echo "RECUSADO: possivel segredo em: $achou"; return 1; }
   git -C "$d" add -A; git -C "$d" commit -q -m "bootstrap $(date +%F\ %H:%M)" 2>/dev/null || echo "nada novo"
   git -C "$d" push -q && echo "publicado: https://github.com/$R"
+}
+
+# ================= ssh com o GitHub =================
+cmd_sshgh() {  # usa chave local ja cadastrada no GitHub; se nenhuma estiver, cria uma com passphrase e cadastra
+  gh auth status >/dev/null 2>&1 || { echo "sem login no gh: rode 'gh auth login --web' e repita"; return 1; }
+  if ! gh api user/keys >/dev/null 2>&1; then echo ">>> o gh precisa de permissao para chaves SSH: vai abrir o login no navegador"; gh auth refresh -h github.com -s admin:public_key </dev/tty || return 1; fi
+  local keys p b found=""; keys=$(gh api user/keys --jq '.[].key' 2>/dev/null) || { echo "nao consegui listar as chaves do GitHub"; return 1; }
+  for p in "$H"/.ssh/*.pub; do [ -f "$p" ] || continue; b=$(awk '{print $2}' "$p"); [ -n "$b" ] && grep -qF "$b" <<<"$keys" && { found="${p%.pub}"; break; }; done
+  if [ -z "$found" ]; then
+    found="$H/.ssh/id_ed25519_github"
+    echo ">>> nenhuma chave local esta cadastrada no GitHub. Criando $found (pede passphrase 2x: use uma, NAO deixe vazio)"
+    [ -f "$found" ] || ssh-keygen -t ed25519 -C "$(hostname)-github" -f "$found" </dev/tty || return 1
+    gh ssh-key add "$found.pub" --title "$(hostname)-$(date +%F)" || return 1
+  else echo "chave ja cadastrada no GitHub: $found"; fi
+  mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"; touch "$H/.ssh/config"; chmod 600 "$H/.ssh/config"
+  if ! grep -q '# initio-github' "$H/.ssh/config"; then
+    printf '\n# initio-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  AddKeysToAgent yes\n' "$found" >> "$H/.ssh/config"; fi
+  ssh -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | tee /dev/stderr | grep -q 'successfully authenticated' && echo "OK: ssh com o GitHub funcionando" || { echo "FALHOU: ssh ainda nao autentica"; return 1; }
 }
 
 # ================= doctor =================
@@ -349,9 +386,10 @@ cmd_doctor() {
   chk "chezmoi sem diferencas" "[ -z \"\$(chezmoi diff 2>/dev/null)\" ]"
   chk "cofre acessivel (OneDrive)" "[ -n \"\$(cofre_dir)\" ]"
   chk "systemd ativo" "[ -d /run/systemd/system ]"
-  chk "shell padrao zsh" "[ \"\$(basename \"\$SHELL\")\" = zsh ]"
-  local t; for t in node java python3 cargo conda docker; do command -v "$t" >/dev/null 2>&1 || [ -x "$H/miniconda3/bin/$t" ] && chk "$t no PATH" "command -v $t || [ -x $H/miniconda3/bin/$t ]" || echo "  --      $t nao instalado"; done
-  command -v docker >/dev/null && chk "docker responde" "docker info"
+  chk "shell padrao zsh (login shell em /etc/passwd)" "[ \"\$(getent passwd $USER | cut -d: -f7 | xargs basename)\" = zsh ]"
+  local t; [ -s "$H/.nvm/nvm.sh" ] && . "$H/.nvm/nvm.sh" >/dev/null 2>&1
+  for t in node java python3 cargo conda docker; do command -v "$t" >/dev/null 2>&1 || [ -x "$H/miniconda3/bin/$t" ] && chk "$t no PATH" "command -v $t || [ -x $H/miniconda3/bin/$t ]" || echo "  --      $t nao instalado"; done
+  command -v docker >/dev/null && { if docker info >/dev/null 2>&1; then echo "  ok      docker responde"; n=$((n+1)); else echo "  --      docker nao responde (esperado se o docker vem do Windows; senao: wsl -t <distro> para ativar grupo/servico)"; fi; }
   [ -f "$(czsrc)/repos.tsv" ] && { local miss=0 rel; while IFS=$'\t' read -r rel _ _; do [ -d "$H/$rel/.git" ] || miss=$((miss+1)); done < "$(czsrc)/repos.tsv"; chk "repos do repos.tsv clonados (faltam $miss)" "[ $miss -eq 0 ]"; }
   chk "perfis instalados: $(cat "$STATE/instalados" 2>/dev/null | tr '\n' ' ')" "[ -s $STATE/instalados ]"
   echo "$n ok, $f falhas"
@@ -373,6 +411,7 @@ initio sync [--upgrade] [--dry] [-q]    captura esta maquina, publica nos dotfil
 initio snapshot [--dry]            so a captura (configs + dependencias novas -> extras.conf)
 initio cofre salvar|publicar|abrir segredos em arquivo age; publicar = release no repo privado do cofre
 initio publicar-boot               espelha initio+perfis+install.sh no repo publico de bootstrap
+initio ssh-github                  cadastra/usa chave SSH no GitHub (cria uma com passphrase se preciso)
 initio doctor                      diagnostico
 initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>
 EOT
@@ -396,6 +435,7 @@ case "$cmd" in
   sync) cmd_sync;;
   snapshot) cmd_snapshot;;
   cofre) cmd_cofre "$@";;
+  ssh-github) cmd_sshgh;;
   doctor) cmd_doctor;;
   perfil) cmd_perfil "$@";;
   all) for f in "$INITIO_HOME"/perfis/*.conf; do PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;

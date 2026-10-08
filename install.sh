@@ -29,4 +29,5 @@ rm -rf "$BOOT"; git clone --depth 1 "https://github.com/$BOOT_REPO.git" "$BOOT"
 export INITIO_HOME="$BOOT"
 bash "$BOOT/initio" restore
 bash "$BOOT/initio" ${PERFIS:-all}
-echo ">>> pronto. Abra um terminal novo (o PATH muda no login) e rode: initio doctor"
+echo ">>> pronto. Abrindo um shell de login novo (PATH e shell padrao atualizados); rode: initio doctor"
+exec "$(getent passwd "$USER" | cut -d: -f7)" -l
