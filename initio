@@ -72,8 +72,14 @@ renovar_chaves() {
 }
 
 # ================= pos-instalacao (configuracao das ferramentas) =================
-pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaurado
-  [ "$(basename "${SHELL:-}")" = zsh ] || S chsh -s "$(command -v zsh)" "$USER"
+pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaurado; starship e zoxide (binarios avulsos)
+  [ "$(getent passwd "$USER" | cut -d: -f7 | xargs basename)" = zsh ] || S chsh -s "$(command -v zsh)" "$USER"
+  mkdir -p "$H/.local/bin"
+  [ -x "$H/.local/bin/starship" ] || command -v starship >/dev/null || { local t; t=$(mktemp -d)
+    curl -fsSL https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-musl.tar.gz -o "$t/s.tgz" && tar -xzf "$t/s.tgz" -C "$t" starship && install -m 0755 "$t/starship" "$H/.local/bin/starship" || { rm -rf "$t"; return 1; }; rm -rf "$t"; }
+  [ -x "$H/.local/bin/zoxide" ] || command -v zoxide >/dev/null || { local z; z=$(mktemp)
+    curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh -o "$z" && sh "$z" --bin-dir "$H/.local/bin" </dev/null || { rm -f "$z"; return 1; }; rm -f "$z"; }
+  return 0
 }
 pos_devops() {  # docker: grupo + servico (so com systemd ativo)
   S usermod -aG docker "$USER"
@@ -87,8 +93,12 @@ pos_go() {  # goenv (clone) + versoes do Go registradas em packages/goenv-versio
   [ -s "$P/goenv-global.txt" ] && cp -f "$P/goenv-global.txt" "$H/.goenv/version"
   return 0
 }
-pos_bun() {  # bun via instalador oficial
-  [ -x "$H/.bun/bin/bun" ] || { curl -fsSL -o "$STATE/bun-install.sh" https://bun.sh/install && bash "$STATE/bun-install.sh" </dev/null; }
+pos_bun() {  # bun via instalador oficial; ele acrescenta linhas nos rc: desfaz (os rc ja vem do chezmoi)
+  [ -x "$H/.bun/bin/bun" ] && return 0
+  local f bk; bk=$(mktemp -d); for f in .bashrc .zshrc .zshenv .profile .zprofile; do [ -f "$H/$f" ] && cp -p "$H/$f" "$bk/$f"; done
+  curl -fsSL -o "$STATE/bun-install.sh" https://bun.sh/install && bash "$STATE/bun-install.sh" </dev/null; local rc=$?
+  for f in .bashrc .zshrc .zshenv .profile .zprofile; do [ -f "$bk/$f" ] && cp -p "$bk/$f" "$H/$f"; done; rm -rf "$bk"
+  return $rc
 }
 
 # ================= instalacao de um perfil (idempotente) =================
@@ -208,7 +218,10 @@ cmd_restore() {
   fi
   grep -qs '^systemd *= *true' /etc/wsl.conf || { printf '\n[boot]\nsystemd=true\n' | S tee -a /etc/wsl.conf >/dev/null; say "systemd habilitado em /etc/wsl.conf (vale no proximo reinicio da distro)"; }
   say "2/5 cofre -> $H (senha do cofre)"; age -d "$COFRE" | tar -xzf - -C "$H" || { echo "falha ao abrir o cofre (senha errada?)"; return 1; }
+  local IS; IS="$(ls -1t "${D:-/nonexistent}"/initio-segredos-*.tar.age 2>/dev/null | head -1)"
+  [ -f "${IS:-}" ] && { say "   segredos do initio (chave ssh do GitHub etc; mesma senha do cofre)"; age -d "$IS" | tar -xzf - -C "$H" || echo "aviso: nao abri $IS"; }
   chmod 700 "$H/.ssh" "$H/.gnupg" 2>/dev/null; chmod 600 "$H"/.ssh/id_* 2>/dev/null
+  [ -f "$H/.ssh/id_ed25519_github" ] && ssh_config_garantir "$H/.ssh/id_ed25519_github"
   say "3/5 chave age do chezmoi (senha do cofre)"; mkdir -p "$H/.config/chezmoi"; chmod 700 "$H/.config/chezmoi"
   age -d -o "$H/.config/chezmoi/key.txt" "$KEY" || { echo "falha ao abrir a chave"; return 1; }; chmod 600 "$H/.config/chezmoi/key.txt"
   printf 'encryption = "age"\n[age]\n    identity = "%s/.config/chezmoi/key.txt"\n    recipient = "%s"\n' "$H" "$(age-keygen -y "$H/.config/chezmoi/key.txt")" > "$H/.config/chezmoi/chezmoi.toml"
@@ -252,6 +265,7 @@ cmd_snapshot() {
   command -v chezmoi >/dev/null || { echo "chezmoi nao instalado (initio restore)"; return 1; }
   local SRC; SRC="$(czsrc)"; [ -d "$SRC/.git" ] || { echo "sem repo chezmoi em $SRC"; return 1; }
   TEXTO=0; CRIPTO=0
+  [ $DRY = 0 ] && { say "-- dotfiles portateis (/home/<usuario> -> \$HOME)"; cmd_portar; }
   say "-- configs (union dos CONFIGS de cada perfil)"
   local f c; for f in "$INITIO_HOME"/perfis/*.conf; do CONFIGS=(); ( . "$f"; printf '%s\n' "${CONFIGS[@]:-}" ); done | sort -u | while read -r c; do [ -n "$c" ] && echo "$c"; done > "$STATE/configs.lista"
   while read -r c; do add_path "$c"; done < "$STATE/configs.lista"
@@ -360,6 +374,10 @@ cmd_publicar_boot() {
 }
 
 # ================= ssh com o GitHub =================
+ssh_config_garantir() {  # $1 = chave privada: garante o bloco "Host github.com" no ~/.ssh/config (idempotente)
+  mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"; touch "$H/.ssh/config"; chmod 600 "$H/.ssh/config"
+  grep -q '# initio-github' "$H/.ssh/config" || printf '\n# initio-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  AddKeysToAgent yes\n' "$1" >> "$H/.ssh/config"
+}
 cmd_sshgh() {  # usa chave local ja cadastrada no GitHub; se nenhuma estiver, cria uma com passphrase e cadastra
   gh auth status >/dev/null 2>&1 || { echo "sem login no gh: rode 'gh auth login --web' e repita"; return 1; }
   if ! gh api user/keys >/dev/null 2>&1; then echo ">>> o gh precisa de permissao para chaves SSH: vai abrir o login no navegador"; gh auth refresh -h github.com -s admin:public_key </dev/tty || return 1; fi
@@ -371,10 +389,42 @@ cmd_sshgh() {  # usa chave local ja cadastrada no GitHub; se nenhuma estiver, cr
     [ -f "$found" ] || ssh-keygen -t ed25519 -C "$(hostname)-github" -f "$found" </dev/tty || return 1
     gh ssh-key add "$found.pub" --title "$(hostname)-$(date +%F)" || return 1
   else echo "chave ja cadastrada no GitHub: $found"; fi
-  mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"; touch "$H/.ssh/config"; chmod 600 "$H/.ssh/config"
-  if ! grep -q '# initio-github' "$H/.ssh/config"; then
-    printf '\n# initio-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  AddKeysToAgent yes\n' "$found" >> "$H/.ssh/config"; fi
+  ssh_config_garantir "$found"
   ssh -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | tee /dev/stderr | grep -q 'successfully authenticated' && echo "OK: ssh com o GitHub funcionando" || { echo "FALHOU: ssh ainda nao autentica"; return 1; }
+}
+
+# ================= dotfiles portateis: /home/<usuario> fixo -> $HOME =================
+cmd_portar() {
+  local f n=0 u="${USER:-$(id -un)}"
+  for f in .zshrc .bashrc .zshenv .zprofile .profile; do
+    [ -f "$H/$f" ] && grep -q "/home/$u" "$H/$f" || continue
+    cp -p "$H/$f" "$H/$f.bak-initio"
+    python3 - "$H/$f" "$u" <<'PY'
+import sys
+p,u=sys.argv[1:3]; lit="/home/"+u; s=open(p).read(); out=[]; i=0
+ctx=["code"]; sq=False; n=len(s)
+while i<n:
+    c=s[i]
+    if sq:
+        if s.startswith(lit,i): out.append("'\"$HOME\"'"); i+=len(lit); continue
+        if c=="'": sq=False
+        out.append(c); i+=1; continue
+    if c=="\\" and i+1<n: out.append(s[i:i+2]); i+=2; continue
+    if s.startswith(lit,i): out.append("$HOME"); i+=len(lit); continue
+    t=ctx[-1]
+    if t=="dq":
+        if c=='"': ctx.pop()
+        elif c=="$" and s.startswith("$(",i): ctx.append("cmd"); out.append("$("); i+=2; continue
+    else:
+        if c=="'": sq=True
+        elif c=='"': ctx.append("dq")
+        elif t=="cmd" and c==")": ctx.pop()
+    out.append(c); i+=1
+open(p,"w").write("".join(out))
+PY
+    if cmp -s "$H/$f" "$H/$f.bak-initio"; then rm -f "$H/$f.bak-initio"; else n=$((n+1)); echo "   portado: $f (backup em $f.bak-initio)"; diff "$H/$f.bak-initio" "$H/$f" | grep '^[<>]' | cut -c1-140; fi
+  done
+  [ $n -eq 0 ] && echo "   dotfiles ja portateis"; return 0
 }
 
 # ================= doctor =================
@@ -436,6 +486,7 @@ case "$cmd" in
   snapshot) cmd_snapshot;;
   cofre) cmd_cofre "$@";;
   ssh-github) cmd_sshgh;;
+  portar) cmd_portar;;
   doctor) cmd_doctor;;
   perfil) cmd_perfil "$@";;
   all) for f in "$INITIO_HOME"/perfis/*.conf; do PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;
