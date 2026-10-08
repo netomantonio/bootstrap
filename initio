@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# initio - ferramenta oficial de ambiente.  initio ajuda
+set -u
+H="$HOME"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELFDIR="$(dirname "$SELF")"
+if [ -z "${INITIO_HOME:-}" ]; then
+  # rodando de um pacote (ex.: B:\_consolidacao\initio) vale o pacote; rodando o instalado, vale ~/.local/share/initio
+  if [ -d "$SELFDIR/perfis" ]; then INITIO_HOME="$SELFDIR"; else INITIO_HOME="$H/.local/share/initio"; fi
+fi
+STATE="$H/.local/state/initio"; mkdir -p "$STATE"
+LOG="$H/initio.log"; DRY=0; UPGRADE=0; RES=()
+PATH="$H/.local/bin:$H/.cargo/bin:$PATH"; export PATH
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+SEGRE='(api[_-]?key|token|secret|passw(or)?d|bearer|ghp_|gho_|github_pat_|sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{12,}|AGE-SECRET-KEY|PRIVATE KEY)'
+say() { echo "[$(date +%H:%M:%S)] $*"; }
+ok()  { RES+=("OK     $1"); }
+bad() { local m; m=$(tail -n 40 "$LOG" 2>/dev/null | grep -iE 'error|erro|fail|not found|could not|unable|denied|conflict' | tail -n 1 | cut -c1-150); RES+=("FALHOU $1${m:+  <- $m}"); }
+S()   { sudo -n -E "$@"; }
+czsrc() { chezmoi source-path 2>/dev/null || echo "$H/.local/share/chezmoi"; }
+cofre_dir() { local d; for d in /mnt/c/Users/*/OneDrive*/Documentos/Credenciais\ e\ Certificados/_cofre; do [ -d "$d" ] && { echo "$d"; return; }; done; }
+
+# ================= base de sudo (uma senha, depois sozinho) =================
+sudo_prep() {
+  [ -n "${SUDO_OK:-}" ] && return; SUDO_OK=1
+  printf "\n>>> SENHA DO SUDO (digite e Enter; nao aparece na tela). Pedida so esta vez:\n"; sudo -v || exit 1
+  ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) & KEEP=$!
+  # WSL: postinst de servicos (ex: openssh-server) falha ao iniciar servico; policy-rc.d=101 impede o dpkg de iniciar servicos
+  if [ ! -e /usr/sbin/policy-rc.d ]; then printf '#!/bin/sh\nexit 101\n' | sudo -n tee /usr/sbin/policy-rc.d >/dev/null && sudo -n chmod +x /usr/sbin/policy-rc.d && MADE=1; fi
+  trap '[ "${MADE:-0}" = 1 ] && sudo -n rm -f /usr/sbin/policy-rc.d; kill ${KEEP:-0} ${TAILPID:-0} 2>/dev/null' EXIT
+  sudo -n dpkg --configure -a </dev/null >/dev/null 2>&1
+}
+
+# ================= repositorios apt de terceiros (docs oficiais, conferidos em 2026-10-07) =================
+repo_docker() {
+  S install -m 0755 -d /etc/apt/keyrings
+  S curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && S chmod a+r /etc/apt/keyrings/docker.asc
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+    "$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")" "$(dpkg --print-architecture)" | S tee /etc/apt/sources.list.d/docker.sources >/dev/null
+  DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+}
+repo_hashicorp() {
+  local t; t=$(mktemp)
+  curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$t" && [ -s "$t" ] || { echo "falha ao baixar chave HashiCorp; repo pulado"; rm -f "$t"; return 1; }
+  gpg --dearmor < "$t" 2>/dev/null | S tee /usr/share/keyrings/hashicorp-archive-keyring.gpg >/dev/null; rm -f "$t"
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") main" | S tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
+  REPO_PKGS+=(vagrant)
+}
+repo_helm() {
+  local id="DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" t; t=$(mktemp)
+  curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey > "$t"
+  [ "$(gpg --show-keys --with-colons "$t" | awk -F: '$1=="fpr"{print $10}' | head -n1)" = "$id" ] || { echo "chave do Helm inesperada; abortando repo helm"; return 1; }
+  gpg --dearmor < "$t" | S tee /usr/share/keyrings/helm.gpg >/dev/null
+  echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | S tee /etc/apt/sources.list.d/helm-stable-debian.list >/dev/null
+  REPO_PKGS+=(helm)
+}
+repo_grafana() {
+  S mkdir -p /etc/apt/keyrings
+  S wget -qO /etc/apt/keyrings/grafana.asc https://apt.grafana.com/gpg-full.key && S chmod 644 /etc/apt/keyrings/grafana.asc
+  echo "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main" | S tee /etc/apt/sources.list.d/grafana.list >/dev/null
+  REPO_PKGS+=(grafana)
+}
+
+# ================= pos-instalacao (configuracao das ferramentas) =================
+pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaurado
+  [ "$(basename "${SHELL:-}")" = zsh ] || S chsh -s "$(command -v zsh)" "$USER"
+}
+pos_devops() {  # docker: grupo + servico (so com systemd ativo)
+  S usermod -aG docker "$USER"
+  if [ -d /run/systemd/system ]; then S systemctl enable --now docker; else echo "systemd inativo: docker so sobe apos reiniciar a distro (wsl -t <nome>)"; fi
+}
+
+# ================= instalacao de um perfil (idempotente) =================
+apt_faltando() { local p; for p in "$@"; do [ -n "$p" ] || continue; dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done; }
+apt_instalar() { local n=0 f=0 p; for p in "$@"; do [ -n "$p" ] || continue
+  if S timeout 300 apt-get install -y -o Dpkg::Options::=--force-confold "$p" >>"$LOG" 2>&1 </dev/null; then n=$((n+1)); else f=$((f+1)); echo "   apt FALHOU: $p"; echo "$p" >> "$H/initio-apt-falhou.txt"; fi; done; ok "apt ($n instalados, $f falharam)"; }
+
+instalar_perfil() {
+  local p="$1" f="$INITIO_HOME/perfis/$1.conf"
+  [ -f "$f" ] || { echo "perfil inexistente: $p (initio list)"; return 1; }
+  DESC=""; APT=(); REPOS=(); NPM=(); NODE=(); SDK=(); PIP=(); PIPX=(); CARGO=(); CONDA=(); CONFIGS=(); RUST=0; POS=""; PIP_FILE=""; REPO_PKGS=(); DOCKER_PKGS=()
+  # shellcheck disable=SC1090
+  . "$f"
+  say "=== perfil: $p - $DESC"
+  if [ $DRY = 1 ]; then
+    echo "   apt: ${APT[*]:-}  repos: ${REPOS[*]:-}"; echo "   node: ${NODE[*]:-}  npm: ${NPM[*]:-}  sdk: ${SDK[*]:-}"
+    echo "   pip: ${PIP[*]:-} ${PIP_FILE}  pipx: ${PIPX[*]:-}  cargo: ${CARGO[*]:-}  conda: ${CONDA[*]:-}  rust: $RUST"; return 0
+  fi
+  sudo_prep; : >> "$LOG"
+  S apt-get update -y >>"$LOG" 2>&1 </dev/null
+  local r; for r in "${REPOS[@]:-}"; do [ -n "$r" ] || continue; dpkg -s "$( [ "$r" = docker ] && echo docker-ce || echo "$r")" >/dev/null 2>&1 && continue
+    "repo_$r" >>"$LOG" 2>&1 && ok "repo $r" || bad "repo $r"; done
+  [ ${#REPOS[@]} -gt 0 ] && S apt-get update -y >>"$LOG" 2>&1 </dev/null
+  local todo; todo=$(apt_faltando "${APT[@]:-}" "${DOCKER_PKGS[@]:-}" "${REPO_PKGS[@]:-}")
+  # shellcheck disable=SC2086
+  [ -n "$todo" ] && apt_instalar $todo
+  [ $UPGRADE = 1 ] && [ -n "${APT[*]:-}" ] && S apt-get install -y --only-upgrade "${APT[@]}" >>"$LOG" 2>&1 </dev/null
+  if [ ${#NODE[@]} -gt 0 ] || [ ${#NPM[@]} -gt 0 ]; then
+    [ -d "$H/.nvm" ] || { git clone -q https://github.com/nvm-sh/nvm.git "$H/.nvm" && ( cd "$H/.nvm" && git checkout -q "$(git describe --abbrev=0 --tags --match 'v[0-9]*' "$(git rev-list --tags --max-count=1)")" ); }
+    export NVM_DIR="$H/.nvm"; set +u; . "$NVM_DIR/nvm.sh" 2>/dev/null
+    local v; for v in "${NODE[@]:-}"; do [ -n "$v" ] || continue; [ -d "$NVM_DIR/versions/node/$v" ] && continue; nvm install "$v" >>"$LOG" 2>&1 </dev/null && ok "node $v" || bad "node $v"; done
+    local n; for n in "${NPM[@]:-}"; do [ -n "$n" ] || continue; npm ls -g --depth=0 "$n" >/dev/null 2>&1 && continue; npm install -g "$n" >>"$LOG" 2>&1 </dev/null && ok "npm -g $n" || bad "npm -g $n"; done; set -u
+  fi
+  if [ ${#SDK[@]} -gt 0 ]; then
+    [ -d "$H/.sdkman" ] || curl -fsSL https://get.sdkman.io | bash >>"$LOG" 2>&1
+    if [ -s "$H/.sdkman/bin/sdkman-init.sh" ]; then
+      sed -i 's/sdkman_auto_answer=false/sdkman_auto_answer=true/' "$H/.sdkman/etc/config" 2>/dev/null
+      set +u; . "$H/.sdkman/bin/sdkman-init.sh"
+      local s c2 v2; for s in "${SDK[@]}"; do c2=${s%% *}; v2=${s#* }; [ -d "$H/.sdkman/candidates/$c2/$v2" ] && continue
+        sdk install $s </dev/null >>"$LOG" 2>&1 && ok "sdk $s" || bad "sdk $s"; done; set -u
+    else bad sdkman; fi
+  fi
+  if { [ "$RUST" = 1 ] || [ ${#CARGO[@]} -gt 0 ]; } && ! command -v rustup >/dev/null; then
+    curl --proto '=https' --tlsv1.2 -fsSL -o "$STATE/rustup-init.sh" https://sh.rustup.rs >>"$LOG" 2>&1 && sh "$STATE/rustup-init.sh" -y >>"$LOG" 2>&1 </dev/null && [ -x "$H/.cargo/bin/rustup" ] && ok rust || bad rust; fi
+  # shellcheck disable=SC1091
+  [ -f "$H/.cargo/env" ] && . "$H/.cargo/env"
+  local k; for k in "${CARGO[@]:-}"; do [ -n "$k" ] || continue; cargo install --list 2>/dev/null | grep -q "^$k v" && continue
+    cargo install --locked "$k" >>"$LOG" 2>&1 </dev/null && ok "cargo $k" || bad "cargo $k"; done
+  local x nm; for x in "${PIPX[@]:-}"; do [ -n "$x" ] || continue; nm="$x"; case "$x" in git+*) nm="${x##*/}"; nm="${nm%.git}";; esac
+    pipx list --short 2>/dev/null | grep -q "^$nm " && continue
+    pipx install "$x" >>"$LOG" 2>&1 </dev/null && ok "pipx $x" || bad "pipx $x"; done
+  local cb="$H/miniconda3/bin/conda"
+  if [ ${#CONDA[@]} -gt 0 ]; then
+    [ -x "$cb" ] || { curl -fsSL -o /tmp/mc.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && bash /tmp/mc.sh -b -p "$H/miniconda3" >>"$LOG" 2>&1 && ok miniconda || bad miniconda; }
+    if [ "${ACEITO_TOS_CONDA:-0}" = 1 ] && [ -x "$cb" ] && "$cb" tos --help >/dev/null 2>&1; then
+      "$cb" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >>"$LOG" 2>&1
+      "$cb" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >>"$LOG" 2>&1
+    fi
+    local e PK="$(czsrc)/packages"
+    for e in "${CONDA[@]}"; do [ -d "$H/miniconda3/envs/$e" ] && continue
+      [ "${ACEITO_TOS_CONDA:-0}" = 1 ] || { bad "conda env $e (termos nao aceitos)"; continue; }
+      [ -f "$PK/conda-$e.yml" ] || { bad "conda env $e (sem $PK/conda-$e.yml)"; continue; }
+      "$cb" env create -y -n "$e" -f "$PK/conda-$e.yml" >>"$LOG" 2>&1 </dev/null && ok "conda env $e" || bad "conda env $e"; done
+  fi
+  if [ ${#PIP[@]} -gt 0 ] || [ -n "$PIP_FILE" ]; then
+    local q; for q in "${PIP[@]:-}"; do [ -n "$q" ] || continue; pip install --user --break-system-packages "$q" >>"$LOG" 2>&1 </dev/null && ok "pip $q" || bad "pip $q"; done
+    local PK2="$(czsrc)/packages"
+    if [ -n "$PIP_FILE" ] && [ -s "$PK2/$PIP_FILE" ]; then
+      local pn=0 pf=0 IGN="$INITIO_HOME/ignore.txt"; while read -r q; do case "$q" in ""|\#*) continue;; esac
+        [ -s "$IGN" ] && grep -qFf <(grep -v '^$' "$IGN") <<<"$q" && continue
+        pip show "${q%%=*}" >/dev/null 2>&1 && continue
+        pip install --user --break-system-packages "$q" >>"$LOG" 2>&1 </dev/null && pn=$((pn+1)) || { pf=$((pf+1)); echo "$q" >> "$H/initio-pip-falhou.txt"; }
+      done < "$PK2/$PIP_FILE"; ok "pip ($PIP_FILE: $pn novos, $pf falharam -> ~/initio-pip-falhou.txt)"
+    fi
+  fi
+  [ -n "$POS" ] && { "$POS" >>"$LOG" 2>&1 && ok "config: $POS" || bad "config: $POS"; }
+  grep -qx "$p" "$STATE/instalados" 2>/dev/null || echo "$p" >> "$STATE/instalados"
+}
+
+pergunta_conda() {
+  [ -n "${ACEITO_TOS_CONDA:-}" ] && return
+  grep -qs '^CONDA=(.\+' "$INITIO_HOME"/perfis/*.conf || return
+  printf 'Conda exige aceitar os Termos de Servico dos canais da Anaconda. Aceitar em seu nome? [s/N] '; r=n; if { : </dev/tty; } 2>/dev/null; then read -r r </dev/tty; fi
+  case "$r" in s|S|sim|SIM) ACEITO_TOS_CONDA=1;; *) ACEITO_TOS_CONDA=0;; esac; export ACEITO_TOS_CONDA
+  if [ "$ACEITO_TOS_CONDA" = 1 ] && [ -x "$H/miniconda3/bin/conda" ] && "$H/miniconda3/bin/conda" tos --help >/dev/null 2>&1; then
+    "$H/miniconda3/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >>"$LOG" 2>&1
+    "$H/miniconda3/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >>"$LOG" 2>&1
+  fi
+}
+instalar_lista() {
+  [ $DRY = 0 ] && sudo_prep   # todas as perguntas juntas no inicio: sudo, depois termos do conda; depois roda sozinho
+  pergunta_conda
+  local _o=(base) _x; for _x in "${PERFIS[@]}"; do [ "$_x" = base ] || printf '%s\n' "${_o[@]}" | grep -qx "$_x" || _o+=("$_x"); done; PERFIS=("${_o[@]}")
+  local p; for p in "${PERFIS[@]}"; do instalar_perfil "$p"; done
+  [ $DRY = 0 ] && { echo; echo "Detalhes: $LOG"; echo "=== RESULTADO"; printf '%s\n' "${RES[@]:-}"; }
+}
+
+# ================= restore: maquina nova -> acessos + dotfiles + repos =================
+cofre_baixar() {  # baixa o release mais recente do repo privado do cofre; login por codigo de dispositivo (2FA no celular)
+  local R="${INITIO_COFRE_REPO:-netomantonio/cofre}" d="$STATE/cofre-dl"
+  command -v gh >/dev/null || return 1
+  gh auth status >/dev/null 2>&1 || gh auth login --hostname github.com --git-protocol https --web </dev/tty || return 1
+  mkdir -p "$d"; chmod 700 "$d"
+  gh release download --repo "$R" --pattern '*.age' --dir "$d" --clobber || return 1
+  echo "$d"
+}
+cmd_restore() {
+  local D COFRE KEY; D="$(cofre_dir)"
+  COFRE="${1:-$(ls -1t "$D"/wsl-segredos-*.tar.age 2>/dev/null | head -1)}"; KEY="${2:-$D/chezmoi-age-key.txt.age}"
+  cd "$H" || return 1; sudo_prep
+  say "1/5 pacotes base"; S apt-get update -y >>"$LOG" 2>&1; S apt-get install -y git curl age ca-certificates gnupg python3 python3-pip rsync gh >>"$LOG" 2>&1 </dev/null || { echo "apt base falhou (ver $LOG)"; return 1; }
+  if ! { [ -f "${COFRE:-}" ] && [ -f "$KEY" ]; }; then
+    say "   cofre local nao encontrado; baixando do GitHub privado (${INITIO_COFRE_REPO:-netomantonio/cofre})"
+    D="$(cofre_baixar)" || { echo "nao consegui baixar o cofre. Confira: repo/release existem? login do gh ok? Ou passe: initio restore <cofre.tar.age> <chave.txt.age>"; return 1; }
+    COFRE="$(ls -1t "$D"/wsl-segredos-*.tar.age 2>/dev/null | head -1)"; KEY="$D/chezmoi-age-key.txt.age"
+    [ -f "${COFRE:-}" ] && [ -f "$KEY" ] || { echo "release sem wsl-segredos-*.tar.age e chezmoi-age-key.txt.age"; return 1; }
+  fi
+  grep -qs '^systemd *= *true' /etc/wsl.conf || { printf '\n[boot]\nsystemd=true\n' | S tee -a /etc/wsl.conf >/dev/null; say "systemd habilitado em /etc/wsl.conf (vale no proximo reinicio da distro)"; }
+  say "2/5 cofre -> $H (senha do cofre)"; age -d "$COFRE" | tar -xzf - -C "$H" || { echo "falha ao abrir o cofre (senha errada?)"; return 1; }
+  chmod 700 "$H/.ssh" "$H/.gnupg" 2>/dev/null; chmod 600 "$H"/.ssh/id_* 2>/dev/null
+  say "3/5 chave age do chezmoi (senha do cofre)"; mkdir -p "$H/.config/chezmoi"; chmod 700 "$H/.config/chezmoi"
+  age -d -o "$H/.config/chezmoi/key.txt" "$KEY" || { echo "falha ao abrir a chave"; return 1; }; chmod 600 "$H/.config/chezmoi/key.txt"
+  printf 'encryption = "age"\n[age]\n    identity = "%s/.config/chezmoi/key.txt"\n    recipient = "%s"\n' "$H" "$(age-keygen -y "$H/.config/chezmoi/key.txt")" > "$H/.config/chezmoi/chezmoi.toml"
+  say "4/5 dotfiles (chezmoi)"; command -v chezmoi >/dev/null || sh -c "$(curl -fsSL get.chezmoi.io)" -- -b "$H/.local/bin"
+  chezmoi init --apply netomantonio || { echo "chezmoi falhou"; return 1; }
+  say "5/5 repos"; local SRC rel url br; SRC="$(czsrc)"
+  if gh auth status >/dev/null 2>&1; then
+    while IFS=$'\t' read -r rel url br; do [ -n "$rel" ] || continue; local d="$H/$rel"
+      [ -d "$d/.git" ] && { say "   ja existe: $rel"; continue; }
+      mkdir -p "$d"; git -C "$d" init -q; git -C "$d" remote add origin "$url"
+      if GIT_TERMINAL_PROMPT=0 git -C "$d" fetch -q origin 2>/dev/null; then git -C "$d" checkout -q -f -B "$br" "origin/$br" 2>/dev/null || git -C "$d" checkout -q -f -B main origin/main 2>/dev/null; say "   ok: $rel ($br)"; else say "   FALHOU o fetch (sem permissao ou repo removido?): $rel - pulado, tentara de novo no proximo restore"; rm -rf "$d/.git"; rmdir "$d" 2>/dev/null; fi
+    done < "$SRC/repos.tsv"
+  else say "gh nao autenticado: o cofre deveria ter trazido o login; rode 'gh auth login' e 'initio restore' de novo"; fi
+  say "restore ok. Proximo: initio all  (ou initio <perfil>)"
+}
+
+# ================= snapshot: captura configs e dependencias desta maquina =================
+add_file() {  # $1 = arquivo absoluto
+  local f="$1"; [ -f "$f" ] && [ ! -L "$f" ] || return
+  [ "$(stat -c %s "$f")" -gt 1048576 ] && { echo "   pula (>1MB): ${f#$H/}"; return; }
+  if grep -qIEi "$SEGRE" "$f" 2>/dev/null; then CRIPTO=$((CRIPTO+1)); [ $DRY = 0 ] && chezmoi add --encrypt "$f" >/dev/null 2>&1
+  else TEXTO=$((TEXTO+1)); [ $DRY = 0 ] && chezmoi add "$f" >/dev/null 2>&1; fi
+}
+add_path() {
+  local p="$H/$1" f; [ -e "$p" ] || return
+  [ -f "$p" ] && { add_file "$p"; return; }
+  while IFS= read -r -d '' f; do add_file "$f"; done < <(find "$p" -type f -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/__pycache__/*' -not -path '*/cache/*' -not -path '*/.cache/*' -not -path '*/skills/synced/*' -not -path '*/skills/.system/*' -not -path '*/skills/graphify/*' -not -path '*/yazi/plugins/*' -not -path '*/yazi/flavors/*' -not -name '*.lock' -not -name 'package-lock.json' -print0 2>/dev/null)
+}
+lista_conhecidos() {  # nomes ja cobertos pelos perfis (um por linha) para o array $1
+  local f; for f in "$INITIO_HOME"/perfis/*.conf; do ( APT=(); NPM=(); PIP=(); CARGO=(); PIPX=(); . "$f"; eval "printf '%s\n' \"\${$1[@]:-}\"" ); done | sed 's/@[^@]*$//' | sed '/^git+/{s#.*/##;s#\.git$##}' | sort -u
+}
+extras_add() {  # $1 = array (APT|NPM|CARGO|PIPX) ; stdin = nomes novos
+  local arr="$1" f="$INITIO_HOME/perfis/extras.conf" novos; novos=$(grep -v '^$' | tr '\n' ' ' | sed 's/ $//')
+  [ -n "$novos" ] || return
+  [ $DRY = 1 ] && { echo "   [dry] novo: $arr += $novos"; return; }
+  [ -f "$f" ] || printf 'DESC="Dependencias que apareceram no uso (detectadas pelo initio snapshot/sync)"\n' > "$f"
+  if grep -q "^$arr=(" "$f"; then sed -i "s/^$arr=(\(.*\))$/$arr=(\1 $novos)/" "$f"; else echo "$arr=($novos)" >> "$f"; fi
+  echo "   novo em extras.conf: $arr += $novos"
+}
+cmd_snapshot() {
+  command -v chezmoi >/dev/null || { echo "chezmoi nao instalado (initio restore)"; return 1; }
+  local SRC; SRC="$(czsrc)"; [ -d "$SRC/.git" ] || { echo "sem repo chezmoi em $SRC"; return 1; }
+  TEXTO=0; CRIPTO=0
+  say "-- configs (union dos CONFIGS de cada perfil)"
+  local f c; for f in "$INITIO_HOME"/perfis/*.conf; do CONFIGS=(); ( . "$f"; printf '%s\n' "${CONFIGS[@]:-}" ); done | sort -u | while read -r c; do [ -n "$c" ] && echo "$c"; done > "$STATE/configs.lista"
+  while read -r c; do add_path "$c"; done < "$STATE/configs.lista"
+  say "   configs: texto=$TEXTO cripto=$CRIPTO"
+  # arquivos ja gerenciados: atualiza o que mudou durante o uso
+  [ $DRY = 0 ] && chezmoi re-add >/dev/null 2>&1
+  say "-- dependencias novas (fora dos perfis) -> extras.conf"
+  local ign="$INITIO_HOME/ignore.txt"; touch "$ign"
+  local con; con="$(lista_conhecidos APT; grep -qs '^REPOS=(.*docker' "$INITIO_HOME"/perfis/*.conf && printf '%s\n' docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; grep -qs '^REPOS=(.*helm' "$INITIO_HOME"/perfis/*.conf && echo helm; grep -qs '^REPOS=(.*grafana' "$INITIO_HOME"/perfis/*.conf && echo grafana; grep -qs '^REPOS=(.*hashicorp' "$INITIO_HOME"/perfis/*.conf && echo vagrant)"
+  dpkg-query -W -f='${Package} ${Priority}\n' $(apt-mark showmanual 2>/dev/null) 2>/dev/null | awk '$2!="required" && $2!="important"{print $1}' | grep -Ev '^(linux-|ubuntu-|snapd|lxd|cloud-|grub|wsl)' | sort -u \
+    | comm -23 - <({ printf '%s\n' "$con"; cat "$ign"; } | sort -u) | extras_add APT
+  if command -v npm >/dev/null && case "$(command -v npm)" in /mnt/*) false;; esac; then
+    npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | sed 's#.*/node_modules/##' | grep -Ev '^(npm|corepack)$' | sort -u | comm -23 - <({ lista_conhecidos NPM; cat "$ign"; } | sort -u) | extras_add NPM
+  fi
+  [ -f "$H/.cargo/env" ] && . "$H/.cargo/env"
+  command -v cargo >/dev/null && cargo install --list 2>/dev/null | awk '/^[^ ]/{print $1}' | sort -u | comm -23 - <({ lista_conhecidos CARGO; cat "$ign"; } | sort -u) | extras_add CARGO
+  command -v pipx >/dev/null && pipx list --short 2>/dev/null | awk '{print $1}' | sort -u | comm -23 - <({ lista_conhecidos PIPX; cat "$ign"; } | sort -u) | extras_add PIPX
+  [ $DRY = 1 ] && return 0
+  say "-- listas em packages/ (pip --user, envs conda, sdkman, nvm)"
+  local PK="$SRC/packages"; mkdir -p "$PK"
+  pip list --user --format=freeze 2>/dev/null | grep -v ' @ ' | { if [ -s "$ign" ]; then grep -vFf <(grep -v '^$' "$ign"); else cat; fi; } > "$PK/pip-user.txt"
+  local cb="$H/miniconda3/bin/conda" e
+  [ -x "$cb" ] && for e in $("$cb" env list 2>/dev/null | awk '$1!="#" && NF>0 && $1!="base"{print $1}'); do "$cb" env export --no-builds -n "$e" > "$PK/conda-$e.yml" 2>/dev/null; done
+  { echo '# sdkman'; ls "$H"/.sdkman/candidates/*/ 2>/dev/null; echo '# nvm'; ls "$H/.nvm/versions/node" 2>/dev/null; } > "$PK/runtimes.txt"
+  apt-mark showmanual 2>/dev/null > "$PK/apt-manual.txt"
+  # repos (proprios e externos: so registra url+branch, nunca faz push)
+  find "$H" -maxdepth 6 -name .git -type d 2>/dev/null | grep -Ev '/(node_modules|\.venv|venv|\.cache|\.npm|miniconda3|\.nvm|\.cargo|\.rustup|\.sdkman|\.oh-my-zsh|\.goenv|\.zsh|\.tmux|\.vim|\.config|\.bun|\.pyenv|\.rbenv|site-packages|vendor|_QUARENTENA|_da-wsl)(/|$)|\.local/(share|state)|/\.(claude|codex)/' | sed 's#/\.git$##' | sort | while read -r r; do
+    u=$(git -C "$r" remote get-url origin 2>/dev/null | sed -E 's#https://[^@]*@#https://#'); [ -n "$u" ] || continue
+    b=$(git -C "$r" branch --show-current 2>/dev/null); printf '%s\t%s\t%s\n' "${r#$H/}" "$u" "${b:-main}"; done > "$SRC/repos.tsv.new" && mv "$SRC/repos.tsv.new" "$SRC/repos.tsv"
+  say "   repos.tsv: $(wc -l < "$SRC/repos.tsv") repos"
+  # ferramentas nao automatizadas (aviso honesto)
+  [ -d "$H/.goenv" ] && echo "   aviso: goenv encontrado; initio ainda NAO instala goenv/go (instale manualmente)"
+  [ -d "$H/.bun" ] && echo "   aviso: bun encontrado; initio ainda NAO instala bun"
+}
+
+# ================= sync: capturar -> publicar -> puxar -> aplicar -> instalar o que falta =================
+self_install() {  # instala/atualiza a copia local (~/.local) a partir de onde o initio esta rodando
+  local T="$H/.local/share/initio"; mkdir -p "$H/.local/bin" "$T/perfis"
+  if [ "$INITIO_HOME" != "$T" ]; then
+    cp -f "$INITIO_HOME"/perfis/*.conf "$T/perfis/"; [ -f "$INITIO_HOME/ignore.txt" ] && cp -f "$INITIO_HOME/ignore.txt" "$T/"
+    INITIO_HOME="$T"
+  fi
+  [ "$SELF" = "$H/.local/bin/initio" ] || { cp -f "$SELF" "$H/.local/bin/initio"; chmod +x "$H/.local/bin/initio"; }
+}
+cmd_sync() {
+  command -v chezmoi >/dev/null || { echo "chezmoi nao instalado (initio restore)"; return 1; }
+  local SRC; SRC="$(czsrc)"
+  say "1/5 puxando mudancas de outras maquinas"
+  git -C "$SRC" pull -q --rebase --autostash 2>&1 | tail -3
+  [ $DRY = 0 ] && self_install
+  say "2/5 capturando esta maquina"; cmd_snapshot
+  [ $DRY = 1 ] && { echo "[dry] pararia aqui (nao publica nem instala)"; return 0; }
+  say "3/5 publicando initio + perfis nos dotfiles"
+  chezmoi add "$H/.local/bin/initio" "$H"/.local/share/initio/perfis/*.conf "$H/.local/share/initio/ignore.txt" >/dev/null 2>&1
+  git -C "$SRC" add -A
+  git -C "$SRC" commit -q -m "initio sync $(date +%F\ %H:%M) @$(hostname)" 2>/dev/null || echo "   nada novo para commitar"
+  git -C "$SRC" push -q 2>&1 | tail -2
+  say "4/5 aplicando"; chezmoi apply >/dev/null 2>&1
+  say "5/5 instalando o que falta nos perfis ja instalados$([ $UPGRADE = 1 ] && echo ' (+upgrade)')"
+  PERFIS=(); [ -s "$STATE/instalados" ] && while read -r p; do PERFIS+=("$p"); done < "$STATE/instalados"
+  [ -f "$INITIO_HOME/perfis/extras.conf" ] && ! printf '%s\n' "${PERFIS[@]:-}" | grep -qx extras && PERFIS+=(extras)
+  [ ${#PERFIS[@]} -gt 0 ] || PERFIS=(base)
+  instalar_lista
+}
+
+# ================= cofre =================
+cmd_cofre() {
+  local D; D="$(cofre_dir)"
+  case "${1:-}" in
+    salvar)
+      [ -n "$D" ] || { echo "pasta do cofre nao encontrada"; return 1; }
+      local L="$INITIO_HOME/cofre.list" out="$D/initio-segredos-$(date +%F).tar.age" tmp; tmp=$(mktemp)
+      [ -f "$L" ] || printf '%s\n' .ssh .gnupg .kube .docker/config.json .aws .npmrc .netrc .pypirc .config/gh .config/argocd .config/sops .claude/settings.local.json .zsh_history .bash_history > "$L"
+      ( cd "$H" && { grep -v '^$' "$L" | while read -r x; do [ -e "$x" ] && echo "$x"; done
+        find "$H/projects" -maxdepth 5 -type f \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' \) -not -path '*/node_modules/*' -not -name '*.example' -not -name '*.sample' -not -name '*.template' 2>/dev/null | sed "s#^$H/##"; } | sort -u > "$tmp" )
+      echo "$(wc -l < "$tmp") itens. A seguir o age vai pedir a SENHA DO COFRE (2x, nao aparece na tela)."
+      echo ">>> digite a senha e Enter. NAO deixe vazio (vazio = senha aleatoria que voce nao ve)."
+      ( cd "$H" && tar --exclude='.gnupg/S.*' -czf - -T "$tmp" 2>/dev/null ) | age -p -o "$out" && echo "ok: $out" || { rm -f "$out"; echo "falhou"; }; rm -f "$tmp";;
+    publicar)  # sobe os arquivos cifrados como release do repo privado (cada release leva o conjunto completo)
+      local R="${INITIO_COFRE_REPO:-netomantonio/cofre}" f files=() tag; tag="cofre-$(date +%F-%H%M)"
+      [ -n "$D" ] || { echo "pasta do cofre local nao encontrada (OneDrive)"; return 1; }
+      for f in "$(ls -1t "$D"/wsl-segredos-*.tar.age 2>/dev/null | head -1)" "$D/chezmoi-age-key.txt.age" "$(ls -1t "$D"/wsl-historico-*.tar.age 2>/dev/null | head -1)" "$(ls -1t "$D"/initio-segredos-*.tar.age 2>/dev/null | head -1)"; do [ -f "$f" ] && files+=("$f"); done
+      [ ${#files[@]} -gt 0 ] || { echo "nada para publicar"; return 1; }
+      gh repo view "$R" >/dev/null 2>&1 || { echo "repo $R nao existe. Crie PRIVADO: gh repo create $R --private"; return 1; }
+      [ "$(gh repo view "$R" --json isPrivate -q .isPrivate 2>/dev/null)" = true ] || { echo "RECUSADO: $R nao e privado"; return 1; }
+      # repo vazio nao aceita release (HTTP 422 "Repository is empty"): cria o commit inicial
+      gh api "repos/$R/commits?per_page=1" >/dev/null 2>&1 || gh api -X PUT "repos/$R/contents/README.md" -f message="init" -f content="$(printf 'cofre cifrado (age); so arquivos .age em releases\n' | base64 -w0)" >/dev/null 2>&1 || true
+      gh release create "$tag" "${files[@]}" --repo "$R" --title "$tag" --notes "cofre cifrado (age)" && echo "publicado: $R @ $tag (${#files[@]} arquivos)";;
+    abrir) local a="${2:-$(ls -1t "$D"/*.tar.age 2>/dev/null | head -1)}"; age -d "$a" | tar -xzf - -C "$H" && echo "extraido em $H";;
+    *) echo "uso: initio cofre salvar | publicar | abrir [arquivo]";;
+  esac
+}
+
+# ================= bootstrap publico (sem segredos) =================
+cmd_publicar_boot() {
+  local R="${INITIO_BOOT_REPO:-netomantonio/bootstrap}" d="$STATE/boot" f
+  gh repo view "$R" >/dev/null 2>&1 || { echo "repo $R nao existe. Crie PUBLICO: gh repo create $R --public"; return 1; }
+  [ "$(gh repo view "$R" --json isPrivate -q .isPrivate 2>/dev/null)" = false ] || { echo "$R nao e publico (o download na maquina nova nao funcionaria)"; return 1; }
+  [ -d "$d/.git" ] || gh repo clone "$R" "$d" -- -q
+  git -C "$d" pull -q --rebase 2>/dev/null
+  mkdir -p "$d/perfis"; cp -f "$INITIO_HOME"/perfis/*.conf "$d/perfis/"; cp -f "$SELF" "$d/initio"
+  for f in ignore.txt install.sh worker.js; do [ -f "$INITIO_HOME/$f" ] && cp -f "$INITIO_HOME/$f" "$d/$f"; done
+  # trava: nada que pareca segredo vai para um repo publico
+  local achou; achou=$(grep -rIEl "$SEGRE" "$d" --exclude-dir=.git --exclude=initio 2>/dev/null)
+  [ -z "$achou" ] || { echo "RECUSADO: possivel segredo em: $achou"; return 1; }
+  git -C "$d" add -A; git -C "$d" commit -q -m "bootstrap $(date +%F\ %H:%M)" 2>/dev/null || echo "nada novo"
+  git -C "$d" push -q && echo "publicado: https://github.com/$R"
+}
+
+# ================= doctor =================
+cmd_doctor() {
+  local n=0 f=0; chk() { if eval "$2" >/dev/null 2>&1; then echo "  ok      $1"; n=$((n+1)); else echo "  FALHOU  $1"; f=$((f+1)); fi; }
+  chk "gh autenticado" "gh auth status"
+  chk "git user.name/email" "[ -n \"\$(git config --global user.name)\" ] && [ -n \"\$(git config --global user.email)\" ]"
+  chk "chaves ssh presentes" "ls $H/.ssh/id_*"
+  chk "chezmoi sem diferencas" "[ -z \"\$(chezmoi diff 2>/dev/null)\" ]"
+  chk "cofre acessivel (OneDrive)" "[ -n \"\$(cofre_dir)\" ]"
+  chk "systemd ativo" "[ -d /run/systemd/system ]"
+  chk "shell padrao zsh" "[ \"\$(basename \"\$SHELL\")\" = zsh ]"
+  local t; for t in node java python3 cargo conda docker; do command -v "$t" >/dev/null 2>&1 || [ -x "$H/miniconda3/bin/$t" ] && chk "$t no PATH" "command -v $t || [ -x $H/miniconda3/bin/$t ]" || echo "  --      $t nao instalado"; done
+  command -v docker >/dev/null && chk "docker responde" "docker info"
+  [ -f "$(czsrc)/repos.tsv" ] && { local miss=0 rel; while IFS=$'\t' read -r rel _ _; do [ -d "$H/$rel/.git" ] || miss=$((miss+1)); done < "$(czsrc)/repos.tsv"; chk "repos do repos.tsv clonados (faltam $miss)" "[ $miss -eq 0 ]"; }
+  chk "perfis instalados: $(cat "$STATE/instalados" 2>/dev/null | tr '\n' ' ')" "[ -s $STATE/instalados ]"
+  echo "$n ok, $f falhas"
+}
+
+# ================= perfil add =================
+cmd_perfil() {
+  [ "${1:-}" = add ] && [ $# -ge 4 ] || { echo "uso: initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>"; return 1; }
+  local p="$2" t="${3^^}" pkg="$4" f="$INITIO_HOME/perfis/$2.conf"; [ -f "$f" ] || { echo "perfil inexistente: $p"; return 1; }
+  case "$t" in APT|NPM|PIP|CARGO|PIPX) ;; *) echo "tipo invalido: $3"; return 1;; esac
+  if grep -q "^$t=(" "$f"; then sed -i "s/^$t=(\(.*\))$/$t=(\1 $pkg)/" "$f"; else echo "$t=($pkg)" >> "$f"; fi
+  echo "ok: $t += $pkg em $p (rode 'initio sync' para publicar e instalar)"
+}
+
+ajuda() { cat <<'EOT'
+initio restore [cofre] [chave]     maquina nova: cofre + chave + dotfiles + repos
+initio <perfil>... | all | bootstrap   instala perfis (base sempre primeiro); initio list mostra
+initio sync [--upgrade] [--dry] [-q]    captura esta maquina, publica nos dotfiles, puxa, aplica e instala o que falta
+initio snapshot [--dry]            so a captura (configs + dependencias novas -> extras.conf)
+initio cofre salvar|publicar|abrir segredos em arquivo age; publicar = release no repo privado do cofre
+initio publicar-boot               espelha initio+perfis+install.sh no repo publico de bootstrap
+initio doctor                      diagnostico
+initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>
+EOT
+}
+
+# ================= entrada =================
+VERBOSE=1; [ -t 1 ] || VERBOSE=0
+ARGS=(); for a in "$@"; do case "$a" in --dry) DRY=1;; --upgrade) UPGRADE=1;; -q|--quiet) VERBOSE=0;; -v|--verbose) VERBOSE=1;; *) ARGS+=("$a");; esac; done
+# verbose (padrao em terminal): mostra ao vivo o que vai para o log (apt, npm, cargo...); -q silencia
+if [ "$VERBOSE" = 1 ] && [ "$DRY" = 0 ]; then
+  : >> "$LOG"; tail -n0 -F "$LOG" 2>/dev/null | sed -u 's/^/      | /' &
+  TAILPID=$!; trap 'kill $TAILPID 2>/dev/null' EXIT
+fi
+set -- "${ARGS[@]:-ajuda}"; cmd="$1"; shift || true
+PERFIS=()
+case "$cmd" in
+  ajuda|help|-h|--help) ajuda;;
+  list) for f in "$INITIO_HOME"/perfis/*.conf; do b=$(basename "$f" .conf); ( DESC=""; . "$f"; printf '  %-12s %s\n' "$b" "$DESC" ); done;;
+  restore) cmd_restore "$@";;
+  publicar-boot) cmd_publicar_boot;;
+  sync) cmd_sync;;
+  snapshot) cmd_snapshot;;
+  cofre) cmd_cofre "$@";;
+  doctor) cmd_doctor;;
+  perfil) cmd_perfil "$@";;
+  all) for f in "$INITIO_HOME"/perfis/*.conf; do PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;
+  bootstrap) PERFIS=(base); instalar_lista;;
+  *) PERFIS=("$cmd" "$@"); instalar_lista;;
+esac

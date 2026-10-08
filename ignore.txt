@@ -1,0 +1,5 @@
+mgccli
+nexus-
+yazi-cli
+yazi-fm
+virtualbox
