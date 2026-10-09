@@ -19,7 +19,7 @@ bad() { local m; m=$(tail -n 40 "$LOG" 2>/dev/null | grep -iE 'error|erro|fail|n
 S()   { sudo -n -E "$@"; }
 age_d() { if { : </dev/tty; } 2>/dev/null; then age -d "$@" </dev/tty; else echo "sem terminal (/dev/tty): rode initio restore direto num terminal, nao via pipe" >&2; return 1; fi; }
 czsrc() { chezmoi source-path 2>/dev/null || echo "$H/.local/share/chezmoi"; }
-cofre_dir() { local d; [ "${INITIO_SEM_ONEDRIVE:-0}" = 1 ] && return 0; for d in /mnt/c/Users/*/OneDrive*/Documentos/Credenciais\ e\ Certificados/_cofre; do [ -d "$d" ] && { echo "$d"; return; }; done; }
+cofre_dir() { local d; [ -n "${INITIO_COFRE_DIR:-}" ] && { echo "$INITIO_COFRE_DIR"; return; }; [ "${INITIO_SEM_ONEDRIVE:-0}" = 1 ] && return 0; for d in /mnt/c/Users/*/OneDrive*/Documentos/Credenciais\ e\ Certificados/_cofre; do [ -d "$d" ] && { echo "$d"; return; }; done; }
 
 # ================= base de sudo (uma senha, depois sozinho) =================
 sudo_prep() {
@@ -261,6 +261,7 @@ cmd_restore() {
   say "2/5 cofre -> $H (senha do cofre)"; age_d "$COFRE" | tar -xzf - -C "$H" || { echo "falha ao abrir o cofre (senha errada?)"; return 1; }
   local IS; IS="$(ls -1t "${D:-/nonexistent}"/initio-segredos-*.tar.age 2>/dev/null | head -1)"
   [ -f "${IS:-}" ] && { say "   segredos do initio (chave ssh do GitHub etc; mesma senha do cofre)"; age_d "$IS" | tar -xzf - -C "$H" || echo "aviso: nao abri $IS"; }
+  local IA; IA="$(ls -1t "${D:-/nonexistent}"/initio-ia-[0-9]*.tar.age 2>/dev/null | head -1)"; [ -f "${IA:-}" ] || IA="$(ls -1t "${D:-/nonexistent}"/initio-ia-leve-*.tar.age 2>/dev/null | head -1)"; [ -f "${IA:-}" ] && ia_restaurar "$IA"
   chmod 700 "$H/.ssh" "$H/.gnupg" 2>/dev/null; chmod 600 "$H"/.ssh/id_* 2>/dev/null
   [ -f "$H/.ssh/id_ed25519_github" ] && ssh_config_garantir "$H/.ssh/id_ed25519_github"
   say "3/5 chave age do chezmoi (senha do cofre)"; mkdir -p "$H/.config/chezmoi"; chmod 700 "$H/.config/chezmoi"
@@ -397,7 +398,7 @@ cmd_cofre() {
     publicar)  # sobe os arquivos cifrados como release do repo privado (cada release leva o conjunto completo)
       local R="${INITIO_COFRE_REPO:-netomantonio/cofre}" f files=() tag; tag="cofre-$(date +%F-%H%M)"
       [ -n "$D" ] || { echo "pasta do cofre local nao encontrada (OneDrive)"; return 1; }
-      for f in "$(ls -1t "$D"/wsl-segredos-*.tar.age 2>/dev/null | head -1)" "$D/chezmoi-age-key.txt.age" "$(ls -1t "$D"/wsl-historico-*.tar.age 2>/dev/null | head -1)" "$(ls -1t "$D"/initio-segredos-*.tar.age 2>/dev/null | head -1)"; do [ -f "$f" ] && files+=("$f"); done
+      for f in "$(ls -1t "$D"/wsl-segredos-*.tar.age 2>/dev/null | head -1)" "$D/chezmoi-age-key.txt.age" "$(ls -1t "$D"/wsl-historico-*.tar.age 2>/dev/null | head -1)" "$(ls -1t "$D"/initio-segredos-*.tar.age 2>/dev/null | head -1)" "$(ls -1t "$D"/initio-ia-leve-*.tar.age 2>/dev/null | head -1)"; do [ -f "$f" ] || continue; if [ "$(stat -c %s "$f")" -gt 1900000000 ]; then echo "PULEI $(basename "$f") ($(du -h "$f" | cut -f1)): acima do limite de 2 GB do release"; continue; fi; files+=("$f"); done
       [ ${#files[@]} -gt 0 ] || { echo "nada para publicar"; return 1; }
       gh repo view "$R" >/dev/null 2>&1 || { echo "repo $R nao existe. Crie PRIVADO: gh repo create $R --private"; return 1; }
       [ "$(gh repo view "$R" --json isPrivate -q .isPrivate 2>/dev/null)" = true ] || { echo "RECUSADO: $R nao e privado"; return 1; }
@@ -408,6 +409,86 @@ cmd_cofre() {
     *) echo "uso: initio cofre salvar | publicar | abrir [arquivo]";;
   esac
 }
+
+# ===== ia: historico, memoria, sessoes, MCPs, plugins, skills, agents de Claude/Codex/Gemini (cifrado, no cofre) =====
+IA_ITENS=(.claude .claude.json .codex .gemini .agents .config/kilo)
+# nunca vao: credenciais (login de novo e 1x) e cache regeneravel. Tudo o mais dentro de IA_ITENS vai.
+IA_EXCL_COMUM=(.credentials.json auth.json cache shell-snapshots statsig telemetry ide debug paste-cache image-cache session-env plugins/cache plugins/marketplaces local file-history downloads log logs tmp .tmp models_cache.json 'logs_*.sqlite*')
+# especificos (vistos no inventario real): runtimes/pacotes baixados, sandbox e segredos do codex, perfil de navegador e token do gemini
+IA_EXCL_CODEX=(packages plugins shell_snapshots '.sandbox*' secrets)
+IA_EXCL_GEMINI=(oauth_creds.json antigravity_backups antigravity-backup antigravity-browser-profile)
+IA_EXCL_LEVE=('.codex/sessions' '.codex/archived_sessions' '.codex/thread_history_1.sqlite*')
+ia_bases() {  # "base<TAB>rotulo": home do WSL e, se existirem, homes do Windows com .claude/.codex
+  printf '%s\tlinux\n' "$H"
+  local u n; for u in /mnt/c/Users/*; do [ -d "$u" ] || continue; n=$(basename "$u"); case "$n" in Public|Default*|"All Users"|desktop.ini|CodexSandbox*) continue;; esac
+    if [ -d "$u/.claude" ] || [ -d "$u/.codex" ] || [ -f "$u/.claude.json" ]; then printf '%s\twin-%s\n' "$u" "$n"; fi; done
+}
+ia_excl_nomes() {  # $1 = raiz (.claude|.codex|.gemini|.agents)
+  printf '%s\n' "${IA_EXCL_COMUM[@]}"
+  case "$1" in .codex) printf '%s\n' "${IA_EXCL_CODEX[@]}";; .gemini) printf '%s\n' "${IA_EXCL_GEMINI[@]}";; esac
+}
+ia_excl_args() {  # imprime --exclude=... ancorados por raiz; $1=leve
+  printf '%s\n' --no-anchored --exclude=node_modules --exclude=__pycache__ --anchored
+  local r n; for r in .claude .codex .gemini .agents; do while IFS= read -r n; do printf '%s\n' "--exclude=$r/$n"; done < <(ia_excl_nomes "$r"); done
+  [ "${1:-}" = leve ] && for n in "${IA_EXCL_LEVE[@]}"; do printf '%s\n' "--exclude=$n"; done
+}
+ia_inventario() {
+  local base rot it p kb tot=0 st n
+  say "inventario de IA (o que existe e o que o 'initio ia salvar' leva)"
+  while IFS=$'\t' read -r base rot; do
+    echo; echo "== $rot ($base)"
+    for it in "${IA_ITENS[@]}"; do
+      p="$base/$it"; [ -e "$p" ] || continue
+      if [ -d "$p" ]; then
+        printf '%s\n' "$it/ (raiz)"
+        while IFS= read -r e; do n=$(basename "$e"); kb=$(du -sk "$e" 2>/dev/null | cut -f1); st=salvo
+          while IFS= read -r x; do case "$n" in $x) st="EXCLUIDO (cache/segredo/regeneravel)";; esac; done < <(ia_excl_nomes "$it")
+          [ "$it/$n" = .claude/plugins ] && st="salvo (menos plugins/cache e plugins/marketplaces)"
+          printf '   %-34s %8s MB  %s\n' "$n" "$(awk -v k="${kb:-0}" 'BEGIN{printf "%.1f",k/1024}')" "$st"
+          case "$st" in salvo*) tot=$((tot+${kb:-0}));; esac
+        done < <(find "$p" -mindepth 1 -maxdepth 1 2>/dev/null | sort)
+      else kb=$(du -sk "$p" | cut -f1); printf '%s   %8s MB  salvo\n' "$it" "$(awk -v k="$kb" 'BEGIN{printf "%.1f",k/1024}')"; tot=$((tot+kb)); fi
+    done
+    if [ -d "$base/.claude/projects" ]; then
+      echo "   claude: $(find "$base/.claude/projects" -mindepth 1 -maxdepth 1 -type d | wc -l) projetos com historico; $(find "$base/.claude/projects" -maxdepth 2 -type d -name memory 2>/dev/null | wc -l) com pasta memory/"
+      echo "   claude: skills=$(find "$base/.claude/skills" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l) agents=$(find "$base/.claude/agents" -type f 2>/dev/null | wc -l) commands=$(find "$base/.claude/commands" -type f 2>/dev/null | wc -l)"
+    fi
+    [ -d "$base/.codex/sessions" ] && echo "   codex: $(find "$base/.codex/sessions" -type f 2>/dev/null | wc -l) arquivos de sessao"
+  done < <(ia_bases)
+  echo; echo "total a salvar (antes de comprimir): $(awk -v k="$tot" 'BEGIN{printf "%.1f MB", k/1024}')"
+}
+ia_salvar() {
+  local LEVE=""; [ "${1:-}" = --leve ] && LEVE=leve
+  pgrep -x -f '(^|/)(claude|codex)( |$)' >/dev/null 2>&1 && echo "AVISO: claude/codex parece aberto; feche antes (bancos sqlite e sessoes em uso podem sair inconsistentes)"
+  local D; D="$(cofre_dir)"; [ -n "$D" ] || { echo "pasta do cofre nao encontrada (OneDrive)"; return 1; }
+  local out="$D/initio-ia-$([ -n "$LEVE" ] && echo leve-)$(date +%F).tar.age" W; W=$(mktemp -d); local base rot it itens n=0 ex=()
+  mapfile -t ex < <(ia_excl_args $LEVE)
+  say "1/2 empacotando (pode levar minutos; depois pede a senha do cofre 2x)"
+  while IFS=$'\t' read -r base rot; do
+    itens=(); for it in "${IA_ITENS[@]}"; do [ -e "$base/$it" ] && itens+=("$it"); done
+    [ ${#itens[@]} -gt 0 ] || continue
+    tar --warning=no-file-changed --ignore-failed-read "${ex[@]}" -czf "$W/$rot.tgz" -C "$base" "${itens[@]}" 2>/dev/null; n=$((n+1))
+    echo "   $rot: $(du -h "$W/$rot.tgz" | cut -f1) (${#itens[@]} itens)"
+  done < <(ia_bases)
+  [ $n -gt 0 ] || { echo "nada de IA encontrado"; rm -rf "$W"; return 1; }
+  local sz; sz=$(du -sm "$W" | cut -f1); echo "   pacotes: ${sz} MB"
+  [ "$sz" -gt 1900 ] && echo "AVISO: acima de ~1,9 GB o release do GitHub recusa o arquivo (OneDrive aceita). Para reduzir: initio ia salvar --leve (sem sessoes/historico do codex; gera initio-ia-leve-*, o que vai ao GitHub)"
+  say "2/2 cifrando"; echo ">>> digite a senha do cofre e Enter. NAO deixe vazio."
+  tar -cf - -C "$W" . | age -p -o "$out" && echo "ok: $out ($(du -h "$out" | cut -f1)). Para o GitHub: initio cofre publicar" || { rm -f "$out"; echo "falhou"; rm -rf "$W"; return 1; }
+  rm -rf "$W"
+}
+ia_restaurar() {  # $1 = arquivo initio-ia-*.tar.age ; linux -> $H ; windows -> $STATE/ia-windows (copiar a mao)
+  local a="$1" W; [ -f "$a" ] || return 0; W=$(mktemp -d)
+  say "   historico/memoria/config de IA (mesma senha do cofre)"
+  age_d "$a" | tar -xf - -C "$W" || { echo "aviso: nao abri $a"; rm -rf "$W"; return 0; }
+  [ -f "$W/linux.tgz" ] && tar -xzf "$W/linux.tgz" -C "$H" && echo "   restaurado em $H: $(tar -tzf "$W/linux.tgz" | wc -l) entradas"
+  local w; for w in "$W"/win-*.tgz; do [ -f "$w" ] || continue; mkdir -p "$STATE/ia-windows"; cp -f "$w" "$STATE/ia-windows/"; echo "   $(basename "$w") guardado em $STATE/ia-windows (Windows: extrair em C:\\Users\\<usuario>)"; done
+  rm -rf "$W"
+}
+cmd_ia() { case "${1:-}" in
+  inventario|"") ia_inventario;;
+  salvar) shift; ia_salvar "$@";;
+  *) echo "uso: initio ia inventario | salvar"; return 1;; esac; }
 
 # ================= bootstrap publico (sem segredos) =================
 cmd_publicar_boot() {
@@ -760,6 +841,7 @@ initio restore [cofre] [chave]     maquina nova: cofre + chave + dotfiles + repo
 initio <perfil>... | all | bootstrap   instala perfis (base sempre primeiro); initio list mostra
 initio sync [--upgrade] [--dry] [-q]    captura esta maquina, publica nos dotfiles, puxa, aplica e instala o que falta
 initio snapshot [--dry]            so a captura (configs + dependencias novas -> extras.conf)
+initio ia inventario|salvar [--leve]        historico, memoria, sessoes, MCPs e config de claude/codex/gemini (cifrado, vai no cofre)
 initio cofre salvar|publicar|abrir segredos em arquivo age; publicar = release no repo privado do cofre
 initio publicar-boot               espelha initio+perfis+install.sh no repo publico de bootstrap
 initio ssh-github                  cadastra/usa chave SSH no GitHub (cria uma com passphrase se preciso)
@@ -842,6 +924,113 @@ arquivos_duplicados() {  # so leitura; nada e movido nem apagado
   rm -rf "$W"
 }
 
+# move (nunca apaga) copias redundantes para quarentena. dry-run por padrao.
+# regra A: arquivo em B:\projetos\_da-wsl com copia IDENTICA (sha256) em ~/projects -> quarentena
+# regra B: "nome (1).ext" no OneDrive com "nome.ext" identico na MESMA pasta -> quarentena
+arquivos_consolidar() {
+  local APLICAR=0 DESFAZER="" a
+  while [ $# -gt 0 ]; do case "$1" in --aplicar) APLICAR=1; shift;; --desfazer) DESFAZER="${2:-}"; shift 2;; *) echo "uso: initio arquivos consolidar [--aplicar] | --desfazer <log>"; return 1;; esac; done
+  if [ -n "$DESFAZER" ]; then
+    [ -f "$DESFAZER" ] || { echo "log nao existe: $DESFAZER"; return 1; }
+    local n=0 o d; while IFS=$'\t' read -r o d; do [ -e "$d" ] || continue; [ -e "$o" ] && { echo "pulei (ja existe): $o"; continue; }; mkdir -p "$(dirname "$o")"; mv -n -- "$d" "$o" && n=$((n+1)); done < "$DESFAZER"
+    echo "restaurados: $n"; return 0
+  fi
+  local WSLP="${INITIO_WSL_PROJ:-$H/projects}" BD="${INITIO_B_DAWSL:-/mnt/b/projetos/_da-wsl}" Q="${INITIO_QUAR:-/mnt/b/_QUARENTENA}/duplicadas-$(date +%F-%H%M)"
+  local OD=(); [ -n "${INITIO_ONEDRIVE:-}" ] && IFS=: read -ra OD <<<"$INITIO_ONEDRIVE"; if [ ${#OD[@]} -eq 0 ]; then local r; for r in /mnt/c/Users/*/OneDrive*; do [ -d "$r/Documentos" ] || [ -d "$r/Documents" ] && OD+=("$r"); done; fi
+  local W; W=$(mktemp -d); local PLAN="$H/consolidar-plano-$(date +%F-%H%M).tsv" LOG="$H/consolidar-log-$(date +%F-%H%M).tsv"
+  local ex=( -name node_modules -o -name .pnpm-store -o -name .venv -o -name __pycache__ )
+  : > "$W/plano"
+  if [ -d "$BD" ] && [ -d "$WSLP" ]; then
+    say "A) _da-wsl vs ~/projects (comparando por conteudo)"
+    echo "   listando $WSLP e $BD ..."
+    find "$WSLP" \( "${ex[@]}" \) -prune -o -type f -printf '%s\t%p\n' 2>/dev/null > "$W/w"
+    find "$BD"   \( "${ex[@]}" \) -prune -o -type f -printf '%s\t%p\n' 2>/dev/null > "$W/b"
+    awk -F'\t' 'NR==FNR{t[$1]=1;next} ($1 in t)' "$W/w" "$W/b" > "$W/bc"      # b com tamanho existente no wsl
+    awk -F'\t' 'NR==FNR{t[$1]=1;next} ($1 in t)' "$W/bc" "$W/w" > "$W/wc"
+    cut -f2 "$W/wc" | xargs -r -d '\n' -P4 -n1 sh -c 'printf "%s\t%s\n" "$(sha256sum < "$1" | cut -c1-64)" "$1"' _ > "$W/wh"
+    cut -f2 "$W/bc" | xargs -r -d '\n' -P4 -n1 sh -c 'printf "%s\t%s\n" "$(sha256sum < "$1" | cut -c1-64)" "$1"' _ > "$W/bh"
+    awk -F'\t' 'NR==FNR{h[$1]=$2;next} ($1 in h){print "A\t"$2"\t"h[$1]}' "$W/wh" "$W/bh" >> "$W/plano"
+    echo "   $(wc -l < "$W/b") arquivos em _da-wsl; $(awk -F'\t' '$1=="A"' "$W/plano" | wc -l) tem copia identica no WSL"
+  else echo "A) pulado ($BD ou $WSLP nao existe)"; fi
+  if [ ${#OD[@]} -gt 0 ]; then
+    say "B) copias \"(1)\" no OneDrive"
+    echo "   listando candidatos '(N)' em: ${OD[*]} (OneDrive via Windows e lento; minutos; nao esta travado)"
+    find "${OD[@]}" -type f -name '* (*)*' -printf '%p\n' 2>/dev/null | grep -E ' \([0-9]+\)(\.[^/.]*)?$' > "$W/cand"
+    local tc i=0; tc=$(wc -l < "$W/cand"); echo "   $tc candidatos; comparando com o original (cmp)"
+    while IFS= read -r f; do
+      i=$((i+1)); [ $((i % 50)) = 0 ] && printf '\r   %d/%d' "$i" "$tc" >&2
+      d=$(dirname "$f"); b=$(basename "$f"); base=$(printf '%s' "$b" | sed -E 's/ \([0-9]+\)(\.[^.]*)?$/\1/')
+      [ "$base" != "$b" ] && [ -f "$d/$base" ] && [ "$(stat -c %s "$f")" = "$(stat -c %s "$d/$base")" ] && cmp -s -- "$f" "$d/$base" && printf 'B\t%s\t%s\n' "$f" "$d/$base"
+    done < "$W/cand" >> "$W/plano"; echo >&2
+    echo "   $(awk -F'\t' '$1=="B"' "$W/plano" | wc -l) copias \"(1)\" identicas ao original"
+  fi
+  cp "$W/plano" "$PLAN"
+  local na nb; na=$(awk -F'\t' '$1=="A"' "$W/plano" | wc -l); nb=$(awk -F'\t' '$1=="B"' "$W/plano" | wc -l)
+  local bytes; bytes=$(awk -F'\t' '{print $2}' "$W/plano" | tr '\n' '\0' | xargs -0 -r stat -c %s 2>/dev/null | awk '{s+=$1}END{printf "%.0f", s}')
+  echo; echo "plano: $((na+nb)) arquivos redundantes, $(awk -v b="${bytes:-0}" 'BEGIN{printf "%.2f GB", b/1073741824}') a liberar. Detalhe: $PLAN"
+  if [ -d "$BD" ]; then
+    awk -F'\t' '$1=="A"{print $2}' "$W/plano" | sort > "$W/mov"; find "$BD" -type f 2>/dev/null | sort > "$W/todosb"
+    comm -13 "$W/mov" "$W/todosb" > "$W/ficam"; echo "em _da-wsl FICAM $(wc -l < "$W/ficam") arquivos sem copia identica no WSL (nao serao tocados):"; head -15 "$W/ficam" | sed 's/^/   /'
+    cp "$W/ficam" "$H/consolidar-pendentes-$(date +%F).txt"
+  fi
+  if [ $APLICAR = 0 ]; then echo; echo "DRY-RUN: nada foi movido. Para aplicar: initio arquivos consolidar --aplicar"; rm -rf "$W"; return 0; fi
+  say "aplicando: movendo para $Q (nada e apagado)"; : > "$LOG"; local k o c dest ok=0 bad=0 rel
+  while IFS=$'\t' read -r k o c; do
+    case "$k" in A) rel="_da-wsl/${o#"$BD"/}";; B) rel="onedrive/${o#/mnt/c/Users/}";; esac
+    dest="$Q/$rel"; mkdir -p "$(dirname "$dest")"
+    if [ "$(stat -c %d "$o")" = "$(stat -c %d "$(dirname "$dest")")" ]; then mv -n -- "$o" "$dest" && ok=$((ok+1)) || bad=$((bad+1))
+    else cp -p -n -- "$o" "$dest" && cmp -s -- "$o" "$dest" && rm -- "$o" && ok=$((ok+1)) || { bad=$((bad+1)); echo "falhou: $o"; }; fi
+    [ -e "$dest" ] && printf '%s\t%s\n' "$o" "$dest" >> "$LOG"
+  done < "$W/plano"
+  echo "movidos: $ok; falhas: $bad. Quarentena: $Q"; echo "desfazer tudo: initio arquivos consolidar --desfazer $LOG"
+  rm -rf "$W"
+}
+
+# tira codigo e backups pesados de OneDrive\_QUARENTENA para B:\_QUARENTENA (copia, confere contagem e bytes, so entao remove a origem). dry-run por padrao.
+mover_com_conferencia() {  # $1 origem  $2 destino ; 0 = ok (origem removida), 1 = falhou (origem intacta)
+  local o="$1" d="$2" a b
+  mkdir -p "$(dirname "$d")"; [ -e "$d" ] && { echo "   destino ja existe: $d"; return 1; }
+  a=$(find "$o" -type f -printf '%s\n' 2>/dev/null | awk '{n++;s+=$1}END{print n+0":"s+0}')
+  cp -a -- "$o" "$d" 2>/dev/null
+  b=$(find "$d" -type f -printf '%s\n' 2>/dev/null | awk '{n++;s+=$1}END{print n+0":"s+0}')
+  if [ "$a" = "$b" ]; then rm -rf -- "$o"; return 0; fi
+  echo "   CONFERENCIA FALHOU ($a origem x $b destino): origem mantida, copia parcial em $d"; return 1
+}
+arquivos_limpar_onedrive() {
+  local APLICAR=0 DESFAZER=""
+  while [ $# -gt 0 ]; do case "$1" in --aplicar) APLICAR=1; shift;; --desfazer) DESFAZER="${2:-}"; shift 2;; *) echo "uso: initio arquivos limpar-onedrive [--aplicar] | --desfazer <log>"; return 1;; esac; done
+  if [ -n "$DESFAZER" ]; then
+    [ -f "$DESFAZER" ] || { echo "log nao existe: $DESFAZER"; return 1; }
+    local o d n=0; while IFS=$'\t' read -r o d; do [ -e "$d" ] || continue; mover_com_conferencia "$d" "$o" && n=$((n+1)); done < "$DESFAZER"; echo "restaurados: $n"; return 0
+  fi
+  local OD=(); [ -n "${INITIO_ONEDRIVE:-}" ] && IFS=: read -ra OD <<<"$INITIO_ONEDRIVE"
+  if [ ${#OD[@]} -eq 0 ]; then local r; for r in /mnt/c/Users/*/OneDrive*; do [ -d "$r/Documentos" ] || [ -d "$r/Documents" ] && OD+=("$r"); done; fi
+  [ ${#OD[@]} -gt 0 ] || { echo "OneDrive nao encontrado"; return 1; }
+  local Q="${INITIO_QUAR:-/mnt/b/_QUARENTENA}/de-onedrive-$(date +%F-%H%M)" LOG="$H/limpar-onedrive-log-$(date +%F-%H%M).tsv" root e n kb tot=0 cnt=0
+  : > "$LOG.plano"
+  for root in "${OD[@]}"; do
+    [ -d "$root/_QUARENTENA" ] || continue
+    say "OneDrive: $root/_QUARENTENA"
+    while IFS= read -r e; do
+      n=$(basename "$e"); [ -d "$e" ] || continue
+      if [ "$n" = Backups ] || [[ "$n" == *__[0-9]*-[0-9]* ]] || [[ "$n" == *__teste ]] || [ -d "$e/.git" ] || [ -f "$e/package.json" ] || [ -f "$e/pyproject.toml" ] || [ -d "$e/node_modules" ]; then
+        kb=$(du -sk "$e" 2>/dev/null | cut -f1); tot=$((tot+${kb:-0})); cnt=$((cnt+1))
+        printf '   %8.0f MB  %s\n' "$(awk -v k="${kb:-0}" 'BEGIN{print k/1024}')" "$n"
+        printf '%s\t%s\n' "$e" "$Q/$n" >> "$LOG.plano"
+      fi
+    done < <(find "$root/_QUARENTENA" -mindepth 1 -maxdepth 1 | sort)
+  done
+  echo; echo "$cnt pasta(s) de codigo/backup, $(awk -v k="$tot" 'BEGIN{printf "%.2f GB", k/1048576}') -> $Q"
+  echo "(documentos e CSVs da quarentena ficam onde estao)"
+  if [ $APLICAR = 0 ]; then echo "DRY-RUN: nada foi movido. Para aplicar: initio arquivos limpar-onedrive --aplicar"; rm -f "$LOG.plano"; return 0; fi
+  say "copiando e conferindo (pastas com node_modules demoram)"; : > "$LOG"; local ok=0 bad=0 o d
+  while IFS=$'\t' read -r o d; do
+    echo "   $(basename "$o") ..."
+    if mover_com_conferencia "$o" "$d"; then printf '%s\t%s\n' "$o" "$d" >> "$LOG"; ok=$((ok+1)); else bad=$((bad+1)); fi
+  done < "$LOG.plano"; rm -f "$LOG.plano"
+  echo "movidos: $ok; falhas: $bad. Destino: $Q"; echo "desfazer: initio arquivos limpar-onedrive --desfazer $LOG"
+}
+
 # ================= entrada =================
 VERBOSE=1; [ -t 1 ] || VERBOSE=0
 ARGS=(); for a in "$@"; do case "$a" in --dry) DRY=1;; --upgrade) UPGRADE=1;; -q|--quiet) VERBOSE=0;; -v|--verbose) VERBOSE=1;; *) ARGS+=("$a");; esac; done
@@ -860,12 +1049,15 @@ case "$cmd" in
   sync) cmd_sync;;
   snapshot) cmd_snapshot;;
   cofre) cmd_cofre "$@";;
+  ia) cmd_ia "$@";;
   ssh-github) cmd_sshgh;;
   portar) cmd_portar;;
   doctor) cmd_doctor;;
   perfil) cmd_perfil "$@";;
   repos) cmd_repos "$@";;
-  arquivos) case "${1:-}" in duplicados) shift; arquivos_duplicados "$@";; *) echo "uso: initio arquivos duplicados [--min-kb N] [--baixar] [--tudo] [raiz...]";; esac;;
+  arquivos) case "${1:-}" in duplicados) shift; arquivos_duplicados "$@";;
+      consolidar) shift; arquivos_consolidar "$@";;
+      limpar-onedrive) shift; arquivos_limpar_onedrive "$@";; *) echo "uso: initio arquivos duplicados [--min-kb N] [--baixar] [--tudo] [raiz...] | consolidar [--aplicar] | limpar-onedrive [--aplicar]";; esac;;
   all) for f in "$INITIO_HOME"/perfis/*.conf; do [ "$(basename "$f" .conf)" = extras ] || PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;
   bootstrap) PERFIS=(base); instalar_lista;;
   *) PERFIS=("$cmd" "$@"); instalar_lista;;
