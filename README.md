@@ -39,6 +39,12 @@ Flags globais: `--dry` (não altera nada), `-q` (silencioso), `-v` (verboso, pad
 
 Cada perfil é um arquivo `perfis/<nome>.conf` com `DESC` e as listas de pacotes. Perfis atuais: `base`, `ai-agents`, `devops`, `devsecops`, `genai-train`, `go`, `java-kotlin`, `node-web`, `pentest`, `python-dev`, `rust`, `virt` e `extras` (sobras da captura; não instala sozinho — classifique com `initio perfil add`).
 
+## O que é preservado
+
+- **Dotfiles** (chezmoi): `.zshrc`, `.zshenv`, `.zprofile`, `.zfunc`, `.bashrc`, `.gitconfig`, `.tmux.conf`, starship, e as configs de cada perfil. Scripts próprios de `~/.local/bin` entram só se o repositório de dotfiles for privado (o initio confere).
+- **Plugins de zsh** (`zsh-autosuggestions`, `zsh-syntax-highlighting`): reinstalados pelo perfil `base`.
+- **Cofre cifrado**: chaves e credenciais (`.ssh`, `.aws`, `.kube`...), históricos de shell, `.env-manager`, e os `.env`/`.dev.vars` de todos os repositórios em `PROJETOS_DIR`, devolvidos a cada repo em `initio repos clonar`.
+
 ## Onde ficam os dados
 
 | O quê | Onde |

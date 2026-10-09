@@ -83,6 +83,10 @@ pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaura
     curl -fsSL https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-musl.tar.gz -o "$t/s.tgz" && tar -xzf "$t/s.tgz" -C "$t" starship && install -m 0755 "$t/starship" "$H/.local/bin/starship" || { rm -rf "$t"; return 1; }; rm -rf "$t"; }
   [ -x "$H/.local/bin/zoxide" ] || command -v zoxide >/dev/null || { local z; z=$(mktemp)
     curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh -o "$z" && sh "$z" --bin-dir "$H/.local/bin" </dev/null || { rm -f "$z"; return 1; }; rm -f "$z"; }
+  # plugins de zsh que o .zshrc carrega (source ~/.zsh/plugins/...): clone raso se faltar
+  local pl; for pl in zsh-users/zsh-autosuggestions zsh-users/zsh-syntax-highlighting; do
+    [ -d "$H/.zsh/plugins/${pl#*/}" ] || { mkdir -p "$H/.zsh/plugins"; git clone -q --depth 1 "https://github.com/$pl" "$H/.zsh/plugins/${pl#*/}" || echo "aviso: nao consegui clonar $pl"; }
+  done
   return 0
 }
 pos_devops() {  # docker: grupo + servico (so com systemd ativo)
@@ -262,7 +266,7 @@ cmd_restore() {
   grep -qs '^systemd *= *true' /etc/wsl.conf || { printf '\n[boot]\nsystemd=true\n' | S tee -a /etc/wsl.conf >/dev/null; say "systemd habilitado em /etc/wsl.conf (vale no proximo reinicio da distro)"; }
   say "2/5 cofre -> $H (senha do cofre)"; age_d "$COFRE" | tar -xzf - -C "$H" || { echo "falha ao abrir o cofre (senha errada?)"; return 1; }
   local IS; IS="$(ls -1t "${D:-/nonexistent}"/initio-segredos-*.tar.age 2>/dev/null | head -1)"
-  [ -f "${IS:-}" ] && { say "   segredos do initio (chave ssh do GitHub etc; mesma senha do cofre)"; age_d "$IS" | tar -xzf - -C "$H" || echo "aviso: nao abri $IS"; }
+  [ -f "${IS:-}" ] && { say "   segredos do initio (chave ssh do GitHub etc; mesma senha do cofre)"; age_d "$IS" | tar -xzf - -C "$H" || echo "aviso: nao abri $IS"; [ -d "$H/projetos-env" ] && { rm -rf "$STATE/projetos-env"; mv "$H/projetos-env" "$STATE/projetos-env"; say "   .env dos projetos guardados; entram em cada repo no 'initio repos clonar'"; }; }
   local IA; IA="$(ls -1t "${D:-/nonexistent}"/initio-ia-[0-9]*.tar.age 2>/dev/null | head -1)"; [ -f "${IA:-}" ] || IA="$(ls -1t "${D:-/nonexistent}"/initio-ia-leve-*.tar.age 2>/dev/null | head -1)"; [ -f "${IA:-}" ] && ia_restaurar "$IA"
   chmod 700 "$H/.ssh" "$H/.gnupg" 2>/dev/null; chmod 600 "$H"/.ssh/id_* 2>/dev/null
   [ -f "$H/.ssh/id_ed25519_github" ] && ssh_config_garantir "$H/.ssh/id_ed25519_github"
@@ -305,6 +309,23 @@ extras_add() {  # $1 = array (APT|NPM|CARGO|PIPX) ; stdin = nomes novos
   if grep -q "^$arr=(" "$f"; then sed -i "s/^$arr=(\(.*\))$/$arr=(\1 $novos)/" "$f"; else echo "$arr=($novos)" >> "$f"; fi
   echo "   novo em extras.conf: $arr += $novos   -> escolha o perfil: initio perfil move ${arr,,} <pacote> <perfil>   (perfis: initio list)"
 }
+local_bin_scripts() {  # scripts proprios em ~/.local/bin (shebang, texto, <1MB; fora os entry points gerados por pip/pipx/uv). So entram no repo de dotfiles se ele for PRIVADO.
+  local SRC o f n=0 lista; SRC="$(czsrc)"; o=$(git -C "$SRC" remote get-url origin 2>/dev/null | sed -E 's#^(git@github.com:|https://github.com/)##; s#\.git$##')
+  [ -n "$o" ] && [ "$(gh repo view "$o" --json isPrivate -q .isPrivate 2>/dev/null)" = true ] || { say "   scripts de ~/.local/bin: pulado (repo de dotfiles '$o' nao confirmado como privado)"; return 0; }
+  lista=$(mktemp)
+  for f in "$H"/.local/bin/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    [ "$(stat -c %s "$f")" -lt 1048576 ] || continue
+    [ "$(head -c 2 "$f" 2>/dev/null)" = '#!' ] || continue
+    case " webi gherkin ${INITIO_LOCALBIN_SKIP:-} " in *" $(basename "$f") "*) continue;; esac   # terceiros conhecidos + os que voce listar em INITIO_LOCALBIN_SKIP (env)
+    sed -n 2p "$f" | grep -q 'coding: utf-8' && continue     # entry points gerados por pip/pipx/uv
+    head -1 "$f" | grep -q python && [ "$(wc -l < "$f")" -le 15 ] && continue   # entry point curto de python
+    grep -qIE 'script\\\.pyw|pipx/venvs|uv/tools' "$f" 2>/dev/null && continue
+    grep -qI . "$f" 2>/dev/null || continue
+    echo "${f#$H/}" >> "$lista"; add_file "$f"; n=$((n+1))
+  done
+  say "   scripts proprios em ~/.local/bin: $n ($(tr '\n' ' ' < "$lista" | sed 's#.local/bin/##g'))"; rm -f "$lista"
+}
 cmd_snapshot() {
   command -v chezmoi >/dev/null || { echo "chezmoi nao instalado (initio restore)"; return 1; }
   local SRC; SRC="$(czsrc)"; [ -d "$SRC/.git" ] || { echo "sem repo chezmoi em $SRC"; return 1; }
@@ -313,6 +334,7 @@ cmd_snapshot() {
   say "-- configs (union dos CONFIGS de cada perfil)"
   local f c; for f in "$INITIO_HOME"/perfis/*.conf; do CONFIGS=(); ( . "$f"; printf '%s\n' "${CONFIGS[@]:-}" ); done | sort -u | while read -r c; do [ -n "$c" ] && echo "$c"; done > "$STATE/configs.lista"
   while read -r c; do add_path "$c"; done < "$STATE/configs.lista"
+  local_bin_scripts
   say "   configs: texto=$TEXTO cripto=$CRIPTO"
   # arquivos ja gerenciados: atualiza o que mudou durante o uso
   [ $DRY = 0 ] && chezmoi re-add >/dev/null 2>&1
@@ -391,12 +413,18 @@ cmd_cofre() {
     salvar)
       [ -n "$D" ] || { echo "pasta do cofre nao encontrada"; return 1; }
       local L="$INITIO_HOME/cofre.list" out="$D/initio-segredos-$(date +%F).tar.age" tmp; tmp=$(mktemp)
-      [ -f "$L" ] || printf '%s\n' .ssh .gnupg .kube .docker/config.json .aws .npmrc .netrc .pypirc .config/gh .config/argocd .config/sops .claude/settings.local.json .zsh_history .bash_history .config/initio/env .config/initio/plugins > "$L"
-      ( cd "$H" && { grep -v '^$' "$L" | while read -r x; do [ -e "$x" ] && echo "$x"; done
+      local W; W=$(mktemp -d); local PD; PD="$(projetos_dir)"
+      # .env/.dev.vars de todos os repos em PROJETOS_DIR (fora da home): preparados em staging e restaurados por repo no clone
+      if [ -d "$PD" ] && [ "$PD" != "$H/projects" ]; then
+        ( cd "$PD" && find . -maxdepth 5 \( -name node_modules -o -name _QUARENTENA -o -name .git \) -prune -o -type f \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' \) -not -name '*.example' -not -name '*.sample' -not -name '*.template' -print0 2>/dev/null ) \
+          | while IFS= read -r -d '' x; do mkdir -p "$W/projetos-env/$(dirname "$x")" && cp -p "$PD/$x" "$W/projetos-env/$x"; done
+      fi
+      local ex=(); [ -d "$W/projetos-env" ] && { ex=(-C "$W" projetos-env); echo "   $(find "$W/projetos-env" -type f | wc -l) arquivos .env de $PD"; }
+      ( cd "$H" && { { printf '%s\n' .ssh .gnupg .kube .docker/config.json .aws .npmrc .netrc .pypirc .config/gh .config/argocd .config/sops .claude/settings.local.json .zsh_history .bash_history .config/initio/env .config/initio/plugins; [ -f "$L" ] && cat "$L"; } | grep -v '^$' | while read -r x; do [ -e "$x" ] && echo "$x"; done
         find "$H/projects" -maxdepth 5 -type f \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' \) -not -path '*/node_modules/*' -not -name '*.example' -not -name '*.sample' -not -name '*.template' 2>/dev/null | sed "s#^$H/##"; } | sort -u > "$tmp" )
       echo "$(wc -l < "$tmp") itens. A seguir o age vai pedir a SENHA DO COFRE (2x, nao aparece na tela)."
       echo ">>> digite a senha e Enter. NAO deixe vazio (vazio = senha aleatoria que voce nao ve)."
-      ( cd "$H" && tar --exclude='.gnupg/S.*' -czf - -T "$tmp" 2>/dev/null ) | age -p -o "$out" && echo "ok: $out" || { rm -f "$out"; echo "falhou"; }; rm -f "$tmp";;
+      ( cd "$H" && tar --exclude='.gnupg/S.*' -czf - -T "$tmp" "${ex[@]}" 2>/dev/null ) | age -p -o "$out" && echo "ok: $out" || { rm -f "$out"; echo "falhou"; }; rm -rf "$tmp" "$W";;
     publicar)  # sobe os arquivos cifrados como release do repo privado (cada release leva o conjunto completo)
       local R="${INITIO_COFRE_REPO:-netomantonio/cofre}" f files=() tag; tag="cofre-$(date +%F-%H%M)"
       [ -n "$D" ] || { echo "pasta do cofre local nao encontrada"; return 1; }
@@ -641,6 +669,9 @@ repos_listar() {
 }
 repos_restaurar_locais() {  # $1=nome (do catalogo) $2=destino (clone)  - traz da _QUARENTENA os ARQUIVOS ignorados pelo git (.env, .dev.vars...). Nunca sobrescreve. Pastas (build/cache) so sao listadas.
   local nome="$1" dest="$2" F alt q src f n=0 dirs=() base; F="$(czsrc)/projetos-repos.tsv"
+  if [ -d "$STATE/projetos-env/$nome" ] && [ $DRY = 0 ]; then   # .env guardados no cofre (initio cofre salvar)
+    while IFS= read -r f; do [ -e "$dest/$f" ] && continue; mkdir -p "$dest/$(dirname "$f")" && cp -p "$STATE/projetos-env/$nome/$f" "$dest/$f" && say "      .env do cofre: $nome/$f"; done < <(cd "$STATE/projetos-env/$nome" && find . -type f | sed 's#^\./##')
+  fi
   base=$(awk -F'\t' -v n="$nome" '$1==n{k=split($4,a,"/"); print a[k]}' "$F" 2>/dev/null | head -1)
   src=""
   for q in "$(dirname "$(projetos_dir)")/_QUARENTENA"; do
