@@ -266,7 +266,7 @@ cmd_restore() {
   grep -qs '^systemd *= *true' /etc/wsl.conf || { printf '\n[boot]\nsystemd=true\n' | S tee -a /etc/wsl.conf >/dev/null; say "systemd habilitado em /etc/wsl.conf (vale no proximo reinicio da distro)"; }
   say "2/5 cofre -> $H (senha do cofre)"; age_d "$COFRE" | tar -xzf - -C "$H" || { echo "falha ao abrir o cofre (senha errada?)"; return 1; }
   local IS; IS="$(ls -1t "${D:-/nonexistent}"/initio-segredos-*.tar.age 2>/dev/null | head -1)"
-  [ -f "${IS:-}" ] && { say "   segredos do initio (chave ssh do GitHub etc; mesma senha do cofre)"; age_d "$IS" | tar -xzf - -C "$H" || echo "aviso: nao abri $IS"; [ -d "$H/projetos-env" ] && { rm -rf "$STATE/projetos-env"; mv "$H/projetos-env" "$STATE/projetos-env"; say "   .env dos projetos guardados; entram em cada repo no 'initio repos clonar'"; }; }
+  [ -f "${IS:-}" ] && { say "   segredos do initio (chave ssh do GitHub etc; mesma senha do cofre)"; age_d "$IS" | tar -xzf - -C "$H" || echo "aviso: nao abri $IS"; [ -d "$H/projetos-env" ] && { rm -rf "$STATE/projetos-env"; mv "$H/projetos-env" "$STATE/projetos-env"; say "   .env dos projetos guardados; entram em cada repo no 'initio repos clonar'"; }; [ -d "$H/resgate" ] && { rm -rf "$STATE/resgate"; mv "$H/resgate" "$STATE/resgate"; say "   resgate de repos guardado (stash/bundles/ignorados); volta em 'initio repos clonar'"; }; }
   local IA; IA="$(ls -1t "${D:-/nonexistent}"/initio-ia-[0-9]*.tar.age 2>/dev/null | head -1)"; [ -f "${IA:-}" ] || IA="$(ls -1t "${D:-/nonexistent}"/initio-ia-leve-*.tar.age 2>/dev/null | head -1)"; [ -f "${IA:-}" ] && ia_restaurar "$IA"
   chmod 700 "$H/.ssh" "$H/.gnupg" 2>/dev/null; chmod 600 "$H"/.ssh/id_* 2>/dev/null
   [ -f "$H/.ssh/id_ed25519_github" ] && ssh_config_garantir "$H/.ssh/id_ed25519_github"
@@ -420,6 +420,7 @@ cmd_cofre() {
           | while IFS= read -r -d '' x; do mkdir -p "$W/projetos-env/$(dirname "$x")" && cp -p "$PD/$x" "$W/projetos-env/$x"; done
       fi
       local ex=(); [ -d "$W/projetos-env" ] && { ex=(-C "$W" projetos-env); echo "   $(find "$W/projetos-env" -type f | wc -l) arquivos .env de $PD"; }
+      [ -d "$STATE/resgate" ] && [ -n "$(find "$STATE/resgate" -type f 2>/dev/null | head -1)" ] && { ex+=(-C "$STATE" resgate); echo "   resgate de repos (stash/bundles/ignorados): $(du -sh "$STATE/resgate" | cut -f1)"; }
       ( cd "$H" && { { printf '%s\n' .ssh .gnupg .kube .docker/config.json .aws .npmrc .netrc .pypirc .config/gh .config/argocd .config/sops .claude/settings.local.json .zsh_history .bash_history .config/initio/env .config/initio/plugins; [ -f "$L" ] && cat "$L"; } | grep -v '^$' | while read -r x; do [ -e "$x" ] && echo "$x"; done
         find "$H/projects" -maxdepth 5 -type f \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' \) -not -path '*/node_modules/*' -not -name '*.example' -not -name '*.sample' -not -name '*.template' 2>/dev/null | sed "s#^$H/##"; } | sort -u > "$tmp" )
       echo "$(wc -l < "$tmp") itens. A seguir o age vai pedir a SENHA DO COFRE (2x, nao aparece na tela)."
@@ -628,6 +629,8 @@ cmd_perfil() {
 # ================= repos de projetos: catalogar (url+branch) e clonar sob demanda =================
 projetos_dir() { echo "${PROJETOS_DIR:-$H/projetos}"; }
 repo_roots() { if [ -n "${INITIO_REPO_ROOTS:-}" ]; then echo "$INITIO_REPO_ROOTS" | tr : ' '; else projetos_dir; fi; }  # INITIO_REPO_ROOTS=dir1:dir2 (sem espacos nos caminhos)
+# itens ignorados pelo git que se regeneram (build, cache, dependencias): nunca contam como "so existe aqui"
+REPOS_REGEN='(^|/)(node_modules|\.venv|venv|dist|build|target|__pycache__|\.next|\.nuxt|coverage|\.turbo|\.pytest_cache|\.mypy_cache|\.pnpm-store|\.parcel-cache|\.gradle|\.cache|\.hypothesis|\.ruff_cache|\.output|\.wrangler|\.idea|python_modules|\.models|\.vite|\.eslintcache|[^/]*pycache[^/]*|\.test-[^/]*|logs|relatorio|\.venv[^/]*|venv[^/]*|graphify-out|htmlcov|\.test-results|\.features-gen|\.playwright-mcp|\.pnpm|\.yarn/cache|\.terraform|vendor/bundle)(/|$)|(^|/)infra/charts/[^/]+/charts(/|$)|(^|/)(Chart\.lock|coverage\.xml|\.test-report[^/]*\.json)$|\.coverage$|\.log$|(^|/)=[^/]*$|\.egg-info(/|$)|\.tsbuildinfo$|\.DS_Store$'
 repos_url_limpa() { sed -E 's#https://[^@/]*@#https://#'; }
 repos_catalogar() {  # $1 = arquivo do catalogo; resto = pastas a varrer
   local F="$1"; shift; local roots=("$@") r d n=0 novos=0
@@ -672,6 +675,10 @@ repos_restaurar_locais() {  # $1=nome (do catalogo) $2=destino (clone)  - traz d
   if [ -d "$STATE/projetos-env/$nome" ] && [ $DRY = 0 ]; then   # .env guardados no cofre (initio cofre salvar)
     while IFS= read -r f; do [ -e "$dest/$f" ] && continue; mkdir -p "$dest/$(dirname "$f")" && cp -p "$STATE/projetos-env/$nome/$f" "$dest/$f" && say "      .env do cofre: $nome/$f"; done < <(cd "$STATE/projetos-env/$nome" && find . -type f | sed 's#^\./##')
   fi
+  if [ -d "$STATE/resgate/ignorados/$nome" ] && [ $DRY = 0 ]; then   # ignorados resgatados (initio repos resgatar)
+    while IFS= read -r f; do [ -e "$dest/$f" ] && continue; mkdir -p "$dest/$(dirname "$f")" && cp -a "$STATE/resgate/ignorados/$nome/$f" "$dest/$f" && say "      resgate: $nome/$f"; done < <(cd "$STATE/resgate/ignorados/$nome" && find . \( -type f -o -type l \) | sed 's#^\./##')
+  fi
+  local bd; for bd in "$STATE/resgate/$nome"-*.bundle; do [ -f "$bd" ] && say "      bundle de resgate (stash/WIP): git -C '$dest' fetch '$bd' 'refs/heads/backup/*:refs/heads/backup/*'"; done
   base=$(awk -F'\t' -v n="$nome" '$1==n{k=split($4,a,"/"); print a[k]}' "$F" 2>/dev/null | head -1)
   src=""
   for q in "$(dirname "$(projetos_dir)")/_QUARENTENA"; do
@@ -803,13 +810,13 @@ repos_mover() {  # $1=origem $2=destino. mv; se o Windows negar (pastas somente-
   return 1
 }
 repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --aplicar so mostra o veredito. Nunca apaga: MOVE para _QUARENTENA
-  local F="$1"; shift; local aplicar=0 fetch=0 okign=0 dirs=() a d
-  for a in "$@"; do case "$a" in --aplicar) aplicar=1;; --fetch) fetch=1;; --ok-ignorados) okign=1;; *) dirs+=("${a%/}");; esac; done
-  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos eliminar [--fetch] [--aplicar] [--ok-ignorados] <pasta>...   (sem --aplicar so mostra o que seria movido)"; return 1; }
+  local F="$1"; shift; local aplicar=0 fetch=0 okign=0 okres=0 dirs=() a d
+  for a in "$@"; do case "$a" in --aplicar) aplicar=1;; --fetch) fetch=1;; --ok-ignorados) okign=1;; --ok-resgatado) okres=1;; *) dirs+=("${a%/}");; esac; done
+  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos eliminar [--fetch] [--aplicar] [--ok-ignorados] [--ok-resgatado] <pasta>...   (sem --aplicar so mostra o que seria movido)"; return 1; }
   [ -s "$F" ] || { echo "catalogo vazio: rode 'initio repos catalogar' antes (so elimino copia cujo repo esta catalogado)"; return 1; }
   local ok=0 bloq=0
   for d in "${dirs[@]}"; do
-    local motivos=() url urln br q nome
+    local motivos=() url urln br q nome rescued=0
     echo "=== $d"
     if [ ! -d "$d/.git" ]; then echo "   BLOQUEADO: nao e repo git (snapshot/pasta comum): compare na mao, nao elimino"; bloq=$((bloq+1)); continue; fi
     url=$(git -C "$d" remote get-url origin 2>/dev/null | repos_url_limpa)
@@ -820,17 +827,20 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
     git -C "$d" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || motivos+=("branch atual sem upstream")
     local ahead; ahead=$(git -C "$d" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0); [ "$ahead" = 0 ] || motivos+=("$ahead commit(s) nao enviados no branch atual")
     # commits em QUALQUER branch local que nao existem em nenhum remoto
+    if [ $okres = 1 ] && [ -f "$STATE/resgate/ok/$(repos_resgate_chave "$d")" ] && [ "$(cat "$STATE/resgate/ok/$(repos_resgate_chave "$d")")" = "$(repos_estado_hash "$d")" ]; then
+      rescued=1; say "   resgatado e sem mudanca desde entao: stash, edicoes e ignorados estao cobertos pelo resgate"; fi
     local b so=""; for b in $(git -C "$d" for-each-ref --format='%(refname:short)' refs/heads); do
+      [ $rescued = 1 ] && case "$b" in backup/stash-*|backup/wip-*) continue;; esac
       [ "$(git -C "$d" rev-list --count "$b" --not --remotes 2>/dev/null || echo 1)" = 0 ] || so="$so $b"; done
     [ -z "$so" ] || motivos+=("branch(es) com commits que nao estao em nenhum remoto:$so")
-    [ -z "$(git -C "$d" stash list 2>/dev/null)" ] || motivos+=("ha stash guardado")
+    [ -z "$(git -C "$d" stash list 2>/dev/null)" ] || [ $rescued = 1 ] || motivos+=("ha stash guardado (rode: initio repos resgatar --aplicar $d)")
     git -C "$d" submodule status 2>/dev/null | grep -q . && motivos+=("tem submodulos (nao tratado)")
     say "   [2/3] conferindo alteracoes locais (git status; em disco montado pode levar minutos, nao esta travado)..."
     local pend allst ign; allst=$(timeout 180 git -C "$d" -c core.quotepath=off status --porcelain --ignored 2>/dev/null); local rc=$?
     pend=$(printf '%s\n' "$allst" | grep -v '^!!' | sed '/^$/d')
-    ign=$(printf '%s\n' "$allst" | grep '^!!' | grep -vE 'node_modules|\.venv|(^|/)venv/|/dist/|^!! dist/|(^|/)build/|\.cache|__pycache__|\.next/|\.nuxt/|coverage/|\.turbo|\.pytest_cache|\.mypy_cache|\.pnpm-store|\.parcel-cache|\.gradle|(^|/)target/' | sed '/^$/d')
+    ign=$(printf '%s\n' "$allst" | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d')
     [ $rc = 124 ] && motivos+=("git status estourou o tempo (disco lento): tente de novo")
-    if [ -n "$pend" ]; then
+    if [ -n "$pend" ] && [ $rescued = 0 ]; then
       local nd nu nm neol nreal
       say "   [3/3] separando fim de linha de edicao real..."
       nd=$(printf '%s\n' "$pend" | grep -c '^ D'); nu=$(printf '%s\n' "$pend" | grep -c '^??')
@@ -840,7 +850,7 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
       if [ "$nreal" -gt 0 ]; then motivos+=("$nreal arquivo(s) com EDICAO REAL nao commitada (git -C '$d' diff --ignore-cr-at-eol --stat):"); git -C "$d" -c core.quotepath=off diff --ignore-cr-at-eol --numstat 2>/dev/null | head -8 | awk -F'\t' '{printf "        +%s -%s %s\n",$1,$2,$3}'; fi
       if [ "$nu" -gt 0 ]; then motivos+=("$nu arquivo(s) NOVO(S) nao rastreado(s) (so existem aqui; commite ou ignore):"); git -C "$d" -c core.quotepath=off status --porcelain 2>/dev/null | grep '^??' | head -8 | sed 's/^/        /'; fi
     fi
-    if [ -n "$ign" ] && [ $okign = 0 ]; then motivos+=("$(printf '%s\n' "$ign" | grep -c .) item(ns) IGNORADO(s) pelo .gitignore que so existem aqui (NAO estao no GitHub; ex.: .env, chaves, bancos). Copie/guarde o que importar e rode de novo com --ok-ignorados:"); printf '%s\n' "$ign" | head -12 | sed 's/^!! /        /'; fi
+    if [ -n "$ign" ] && [ $okign = 0 ] && [ $rescued = 0 ]; then motivos+=("$(printf '%s\n' "$ign" | grep -c .) item(ns) IGNORADO(s) pelo .gitignore que so existem aqui (NAO estao no GitHub; ex.: .env, chaves, bancos). Copie/guarde o que importar e rode de novo com --ok-ignorados:"); printf '%s\n' "$ign" | head -12 | sed 's/^/        /'; fi
     if [ ${#motivos[@]} -gt 0 ]; then bloq=$((bloq+1)); local m; for m in "${motivos[@]}"; do echo "   BLOQUEADO: $m"; done; continue; fi
     br=$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null || echo "-"); q=$(repos_quarentena_de "$d"); nome="$(basename "$d")__$(date +%Y%m%d-%H%M%S)"
     if [ $aplicar = 0 ]; then echo "   PODE ELIMINAR: tudo ja esta em $url ($br) -> moveria para $q/$nome   (confirme com --aplicar)"; ok=$((ok+1)); continue; fi
@@ -854,6 +864,96 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
   say "eliminar: $ok $([ $aplicar = 1 ] && echo movido\(s\) || echo elegivel\(is\)), $bloq bloqueado(s). Nada e apagado de vez: esvazie a quarentena voce mesmo quando quiser."
   [ $bloq -eq 0 ]
 }
+
+# ===== resgate: o que so existe nesta maquina (stash, edicoes nao commitadas, arquivos ignorados) =====
+repos_resgate_itens() {  # $1=repo -> itens IGNORADOS pelo git que nao se regeneram (pasta termina em /), um por linha
+  git -C "$1" -c core.quotepath=off status --porcelain --ignored 2>/dev/null | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d'
+}
+repos_resgate_chave() { printf '%s-%s' "$(printf '%s' "$1" | md5sum | cut -c1-10)" "$(basename "$1")"; }
+repos_estado_hash() {  # $1=repo -> hash do estado local: HEAD, stash, edicoes, nao rastreados e ignorados relevantes (nome+tamanho+data)
+  local d="$1" it p
+  { git -C "$d" rev-parse HEAD 2>/dev/null
+    git -C "$d" stash list --format=%H 2>/dev/null
+    git -C "$d" -c core.quotepath=off status --porcelain 2>/dev/null
+    git -C "$d" diff HEAD 2>/dev/null | md5sum
+    git -C "$d" ls-files -o --exclude-standard -z 2>/dev/null | ( cd "$d" && xargs -0 -r stat -c '%s %Y %n' 2>/dev/null )
+    repos_resgate_itens "$d" | while IFS= read -r it; do p="$d/${it%/}"
+      if [ -d "$p" ]; then find "$p" -type f -printf '%s %T@ %p\n' 2>/dev/null; else stat -c '%s %Y %n' "$p" 2>/dev/null; fi; done
+  } | sort | md5sum | cut -d' ' -f1
+}
+repos_resgatar() {  # $1=catalogo; [--aplicar] [--publico] [--sem-grandes] [--tudo] <pasta-do-repo>...  - sem --aplicar so mostra. Nunca apaga nada, nao mexe na sua arvore de trabalho.
+  local F="$1"; shift; local aplicar=0 pub=0 semg=0 lim=12 dirs=() a d
+  for a in "$@"; do case "$a" in --aplicar) aplicar=1;; --publico) pub=1;; --sem-grandes) semg=1;; --tudo) lim=100000;; *) dirs+=("${a%/}");; esac; done
+  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos resgatar [--aplicar] [--publico] <pasta-do-repo>...   (sem --aplicar so mostra o plano)"; return 1; }
+  local R="$STATE/resgate" stamp tot_ok=0 tot_inc=0; stamp=$(date +%Y%m%d)
+  for d in "${dirs[@]}"; do
+    echo "=== $d"
+    [ -d "$d/.git" ] || { echo "   PULADO: nao e repo git"; continue; }
+    d=$(cd "$d" && pwd -P)
+    local nome url slug vis push=0 n i br refs=() falhas=() dirty itens=() it kb cop=0 pul=0 erro=0
+    nome=$(awk -F'\t' -v p="$d" '$4==p{print $1; exit}' "$F" 2>/dev/null); [ -n "$nome" ] || nome=$(basename "$d")
+    url=$(git -C "$d" remote get-url origin 2>/dev/null | repos_url_limpa)
+    vis="desconhecida"
+    if [ -n "$url" ]; then
+      slug=$(printf '%s' "$url" | repos_norm)
+      case "$slug" in github.com/*) case "$(gh repo view "${slug#github.com/}" --json isPrivate -q .isPrivate 2>/dev/null)" in true) vis="privado";; false) vis="publico";; esac;; esac
+    fi
+    case "$vis" in privado) push=1;; *) [ $pub = 1 ] && push=1;; esac
+    echo "   repo: ${url:-sem remote} ($vis) -> $([ $push = 1 ] && echo 'backups vao para branches backup/* no GitHub' || echo "backups ficam em bundle no cofre (nao envio para repo $vis; use --publico para forcar)")"
+    git -C "$d" submodule status 2>/dev/null | grep -q . && echo "   AVISO: tem submodulos: o resgate NAO cobre o conteudo deles; confira a mao (git -C '$d' submodule status)"
+    # 1) stash -> branch backup/stash-N
+    n=$(git -C "$d" stash list 2>/dev/null | wc -l)
+    for ((i=0;i<n;i++)); do br="backup/stash-$i-$stamp"
+      echo "   stash@{$i}: $(git -C "$d" log -1 --format=%s "stash@{$i}" 2>/dev/null | cut -c1-80)  -> $br"
+      if [ $aplicar = 1 ]; then git -C "$d" branch -f "$br" "stash@{$i}" 2>>"$LOG" && refs+=("$br") || { echo "   ERRO ao criar $br"; erro=1; }; fi
+    done
+    # 2) edicoes + novos nao rastreados -> commit isolado em backup/wip-DATA (indice temporario: a arvore de trabalho nao e tocada)
+    dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l)
+    if [ "$dirty" -gt 0 ]; then
+      br="backup/wip-$stamp"; echo "   $dirty alteracao(oes) nao commitada(s) ou nova(s) -> $br"
+      if [ $aplicar = 1 ]; then
+        local ti tree c gn ge; ti=$(mktemp -u); gn=$(git -C "$d" config user.name || echo initio); ge=$(git -C "$d" config user.email || echo initio@localhost)
+        if GIT_INDEX_FILE="$ti" git -C "$d" read-tree HEAD 2>>"$LOG" && GIT_INDEX_FILE="$ti" git -C "$d" add -A 2>>"$LOG" && tree=$(GIT_INDEX_FILE="$ti" git -C "$d" write-tree 2>>"$LOG") \
+           && c=$(git -C "$d" -c user.name="$gn" -c user.email="$ge" commit-tree "$tree" -p HEAD -m "resgate: WIP de $(hostname) em $(date +%F)" 2>>"$LOG"); then
+          git -C "$d" branch -f "$br" "$c" 2>>"$LOG" && refs+=("$br") || { echo "   ERRO ao criar $br"; erro=1; }
+        else echo "   ERRO ao montar o commit de resgate (repo sem commits? veja $LOG)"; erro=1; fi
+        rm -f "$ti"
+      fi
+    fi
+    # envia os branches (ou, se nao puder, guarda em bundle dentro do cofre)
+    if [ $aplicar = 1 ] && [ ${#refs[@]} -gt 0 ]; then
+      if [ $push = 1 ]; then
+        for br in "${refs[@]}"; do
+          if timeout 180 git -C "$d" push -q origin "$br" 2>>"$LOG"; then echo "   enviado: origin/$br"; else echo "   push de $br FALHOU (sem permissao/rede): vai para bundle"; falhas+=("$br"); fi
+        done
+      else falhas=("${refs[@]}"); fi
+      if [ ${#falhas[@]} -gt 0 ]; then
+        mkdir -p "$R" && git -C "$d" bundle create "$R/$nome-$stamp.bundle" "${falhas[@]}" --not --remotes >>"$LOG" 2>&1 && echo "   bundle (vai no cofre): $R/$nome-$stamp.bundle" || { echo "   ERRO ao criar o bundle (veja $LOG)"; erro=1; }
+      fi
+    fi
+    # 3) ignorados que nao se regeneram -> $STATE/resgate/ignorados/<nome>/ (vai cifrado no cofre); item > 150 MB nao entra
+    mapfile -t itens < <(repos_resgate_itens "$d")
+    [ $aplicar = 1 ] && rm -rf "$R/ignorados/$nome"
+    local tkb=0 ni=0
+    for it in "${itens[@]}"; do
+      [ -n "$it" ] || continue
+      kb=$(du -sk "$d/${it%/}" 2>/dev/null | cut -f1); kb=${kb:-0}
+      if [ "$kb" -gt 153600 ]; then if [ $semg = 1 ]; then echo "   descartado por voce (--sem-grandes): $it ($((kb/1024)) MB)"; else echo "   NAO COPIO (>150 MB): $it ($((kb/1024)) MB): guarde na mao ou use --sem-grandes"; pul=$((pul+1)); fi; continue; fi
+      tkb=$((tkb+kb)); ni=$((ni+1)); [ $ni -le $lim ] && echo "   guardar: $it ($(( (kb+1023)/1024 )) MB)"
+      if [ $aplicar = 1 ]; then mkdir -p "$R/ignorados/$nome/$(dirname "${it%/}")" && cp -a "$d/${it%/}" "$R/ignorados/$nome/$(dirname "${it%/}")/" 2>>"$LOG" && cop=$((cop+1)) || { echo "   ERRO ao copiar $it"; erro=1; }; fi
+    done
+    [ $ni -gt $lim ] && echo "   ... e mais $((ni-lim)) item(ns) (use --tudo para ver); total a guardar: $ni item(ns), $((tkb/1024)) MB"
+    if [ "$n" = 0 ] && [ "$dirty" = 0 ] && [ ${#itens[@]} = 0 ]; then echo "   nada local a resgatar (tudo ja esta no remoto)"; fi
+    if [ $aplicar = 1 ]; then
+      if [ $erro = 0 ] && [ $pul = 0 ]; then mkdir -p "$R/ok" && repos_estado_hash "$d" > "$R/ok/$(repos_resgate_chave "$d")" && echo "   RESGATADO ($cop item(ns) ignorado(s) guardado(s))" && tot_ok=$((tot_ok+1))
+      else echo "   RESGATE INCOMPLETO (erro ou item grande demais): nao libero para eliminar"; tot_inc=$((tot_inc+1)); fi
+    fi
+  done
+  if [ $aplicar = 1 ]; then
+    say "resgatar: $tot_ok completo(s), $tot_inc incompleto(s). Agora: initio cofre salvar && initio cofre publicar (leva stash/bundles/ignorados cifrados)"
+  else say "so o plano (nada foi alterado). Para executar: repita com --aplicar"; fi
+  [ $tot_inc -eq 0 ]
+}
 cmd_repos() {
   local sub="${1:-}"; shift || true; local F; F="$(czsrc)/projetos-repos.tsv"
   case "$sub" in
@@ -863,7 +963,8 @@ cmd_repos() {
     clonar) repos_clonar "$F" "$@";;
     reparar) repos_reparar "$@";;
     eliminar) repos_eliminar "$F" "$@";;
-    *) echo "uso: initio repos catalogar [pasta...] | duplicados [--profundo] | listar | clonar [nome...] | reparar [--eol] <pasta>... | eliminar [--fetch] [--aplicar] <pasta>...   (destino: $(projetos_dir); mude com PROJETOS_DIR)";;
+    resgatar) repos_resgatar "$F" "$@";;
+    *) echo "uso: initio repos catalogar [pasta...] | duplicados [--profundo] | listar | clonar [nome...] | reparar [--eol] <pasta>... | resgatar [--aplicar] [--publico] [--sem-grandes] <pasta>... | eliminar [--fetch] [--aplicar] [--ok-resgatado] <pasta>...   (destino: $(projetos_dir); mude com PROJETOS_DIR)";;
   esac
 }
 
@@ -876,6 +977,7 @@ initio ia inventario|salvar [--leve]        historico, memoria, sessoes, MCPs e 
 initio cofre salvar|publicar|abrir segredos em arquivo age; publicar = release no repo privado do cofre
 initio publicar-boot               espelha initio+perfis+install.sh no repo publico de bootstrap
 initio ssh-github                  cadastra/usa chave SSH no GitHub (cria uma com passphrase se preciso)
+initio repos catalogar|listar|clonar|resgatar|eliminar   catalogo de repos; resgatar guarda stash/WIP/ignorados antes de apagar uma maquina
 initio doctor                      diagnostico
 initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>
 initio repos catalogar [pasta...] registra url+branch dos repos achados (PROJETOS_DIR ou INITIO_REPO_ROOTS)
