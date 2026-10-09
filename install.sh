@@ -3,7 +3,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/netomantonio/bootstrap/main/install.sh)
 # Fluxo: senha do sudo -> instala git/curl/age/gh e baixa os scripts -> PERGUNTAS (todas juntas) -> login do GitHub
 #        (codigo no celular) -> senha do cofre (age) -> roda sozinho.
-# Opcional (sem perguntas): PERFIS="base go" ACEITO_TOS_CONDA=1 INITIO_SEM_ONEDRIVE=1 definidos antes pulam a pergunta correspondente.
+# Opcional (sem perguntas): PERFIS="base go" ACEITO_TOS_CONDA=1 definidos antes pulam a pergunta correspondente.
 set -eu
 BOOT_REPO="${INITIO_BOOT_REPO:-netomantonio/bootstrap}"
 export INITIO_COFRE_REPO="${INITIO_COFRE_REPO:-netomantonio/cofre}"
@@ -68,18 +68,7 @@ perguntas() {
   fi
   export ACEITO_TOS_CONDA
 
-  # 3) fonte do cofre: so pergunta se existir um cofre no OneDrive do Windows
-  if [ -z "${INITIO_SEM_ONEDRIVE:-}" ]; then
-    INITIO_SEM_ONEDRIVE=1
-    local d achou=0
-    for d in /mnt/c/Users/*/OneDrive*/Documentos/Credenciais\ e\ Certificados/_cofre; do [ -d "$d" ] && achou=1; done
-    if [ $achou = 1 ] && tem_tty; then
-      printf '\n>>> Cofre de segredos: achei uma copia no OneDrive. Usar de onde?\n  1) GitHub (padrao, funciona em qualquer maquina)\n  2) OneDrive\nEscolha [1]: '
-      r=$(ler)
-      [ "$r" = 2 ] && INITIO_SEM_ONEDRIVE=0
-    fi
-  fi
-  export INITIO_SEM_ONEDRIVE PERFIS
+  export PERFIS
 }
 
 main() {
@@ -101,7 +90,7 @@ main() {
   gh auth setup-git >/dev/null 2>&1 || true
 
   export INITIO_HOME="$BOOT"
-  echo ">>> perfis: $PERFIS | cofre: $([ "$INITIO_SEM_ONEDRIVE" = 1 ] && echo GitHub || echo OneDrive) | termos conda: $([ "$ACEITO_TOS_CONDA" = 1 ] && echo aceitos || echo nao)"
+  echo ">>> perfis: $PERFIS | cofre: GitHub (privado) | termos conda: $([ "$ACEITO_TOS_CONDA" = 1 ] && echo aceitos || echo nao)"
   bash "$BOOT/initio" restore
   # shellcheck disable=SC2086
   bash "$BOOT/initio" $PERFIS
