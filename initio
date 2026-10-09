@@ -498,7 +498,7 @@ cmd_publicar_boot() {
   [ -d "$d/.git" ] || gh repo clone "$R" "$d" -- -q
   git -C "$d" pull -q --rebase 2>/dev/null
   mkdir -p "$d/perfis"; cp -f "$INITIO_HOME"/perfis/*.conf "$d/perfis/"; cp -f "$SELF" "$d/initio"
-  for f in ignore.txt binarios.tsv install.sh worker.js; do [ -f "$INITIO_HOME/$f" ] && cp -f "$INITIO_HOME/$f" "$d/$f"; done
+  for f in ignore.txt binarios.tsv install.sh worker.js README.md; do [ -f "$INITIO_HOME/$f" ] && cp -f "$INITIO_HOME/$f" "$d/$f"; done
   # trava: nada que pareca segredo vai para um repo publico
   local achou; achou=$(grep -rIEn "$SEGRE" "$d" --exclude-dir=.git --exclude=initio --exclude=binarios.tsv 2>/dev/null | grep -v 'getent passwd')
   [ -z "$achou" ] || { echo "RECUSADO: possivel segredo em: $achou"; return 1; }
@@ -852,6 +852,8 @@ initio repos duplicados [--profundo]  acha o mesmo repo em varios lugares e diz 
 initio repos reparar [--eol] <pasta>... restaura apagados (copia incompleta); --eol descarta modificacoes so de fim de linha
 initio repos eliminar [--aplicar] <pasta>...  confere se tudo esta no GitHub e MOVE a copia p/ _QUARENTENA (sem --aplicar so mostra)
 initio arquivos duplicados [--min-kb N] [--tudo] [raiz...]  acha arquivos de conteudo identico (sha256) entre B:, D: e OneDrive; so leitura
+initio arquivos consolidar [--aplicar]   junta duplicatas de projetos/arquivos (B:, D:, OneDrive, WSL); sem --aplicar so mostra o plano
+initio arquivos limpar-onedrive [--aplicar|--desfazer <log>]  tira codigo/backups de OneDrive\_QUARENTENA para B:\_QUARENTENA
 initio repos listar | clonar [nome...]   mostra o catalogo | clona so o que falta em B:\projetos (nunca faz push)
 EOT
 }

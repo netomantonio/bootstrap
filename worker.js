@@ -1,4 +1,4 @@
-// Cloudflare Worker: serve o install.sh publico do GitHub em um endereco curto (ex.: boot.antoniomiranda.pro).
+// Cloudflare Worker: serve o install.sh publico do GitHub em um endereco curto (ex.: boot.exemplo.dev).
 // Nao guarda nada e nao tem segredo; so repassa o arquivo do repo publico.
 // Deploy (a verificar na doc do wrangler): wrangler deploy; depois ligar o dominio customizado ao Worker.
 const RAW = "https://raw.githubusercontent.com/netomantonio/bootstrap/main/install.sh";
