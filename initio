@@ -23,7 +23,8 @@ cofre_dir() { local d; [ "${INITIO_SEM_ONEDRIVE:-0}" = 1 ] && return 0; for d in
 # ================= base de sudo (uma senha, depois sozinho) =================
 sudo_prep() {
   [ -n "${SUDO_OK:-}" ] && return; SUDO_OK=1
-  printf "\n>>> SENHA DO SUDO (digite e Enter; nao aparece na tela). Pedida so esta vez:\n"; sudo -v || exit 1
+  { printf "\n>>> SENHA DO SUDO (digite e Enter; nao aparece na tela). Pedida so esta vez:\n" >/dev/tty; } 2>/dev/null || printf "\n>>> SENHA DO SUDO (digite e Enter; nao aparece na tela). Pedida so esta vez:\n"
+  sudo -v || exit 1
   ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) & KEEP=$!
   # WSL: postinst de servicos (ex: openssh-server) falha ao iniciar servico; policy-rc.d=101 impede o dpkg de iniciar servicos
   if [ ! -e /usr/sbin/policy-rc.d ]; then printf '#!/bin/sh\nexit 101\n' | sudo -n tee /usr/sbin/policy-rc.d >/dev/null && sudo -n chmod +x /usr/sbin/policy-rc.d && MADE=1; fi
@@ -219,7 +220,8 @@ instalar_perfil() {
 pergunta_conda() {
   [ -n "${ACEITO_TOS_CONDA:-}" ] && return
   grep -qs '^CONDA=(.\+' "$INITIO_HOME"/perfis/*.conf || return
-  printf 'Conda exige aceitar os Termos de Servico dos canais da Anaconda. Aceitar em seu nome? [s/N] '; r=n; if { : </dev/tty; } 2>/dev/null; then read -r r </dev/tty; fi
+  { printf '\n>>> Conda exige aceitar os Termos de Servico dos canais da Anaconda. Aceitar em seu nome? [s/N] ' >/dev/tty; } 2>/dev/null || printf 'Conda exige aceitar os Termos de Servico dos canais da Anaconda. Aceitar em seu nome? [s/N] '
+  r=n; if { : </dev/tty; } 2>/dev/null; then read -r r </dev/tty; fi
   case "$r" in s|S|sim|SIM) ACEITO_TOS_CONDA=1;; *) ACEITO_TOS_CONDA=0;; esac; export ACEITO_TOS_CONDA
   if [ "$ACEITO_TOS_CONDA" = 1 ] && [ -x "$H/miniconda3/bin/conda" ] && "$H/miniconda3/bin/conda" tos --help >/dev/null 2>&1; then
     "$H/miniconda3/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >>"$LOG" 2>&1
@@ -346,11 +348,22 @@ self_install() {  # instala/atualiza a copia local (~/.local) a partir de onde o
   fi
   [ "$SELF" = "$H/.local/bin/initio" ] || { cp -f "$SELF" "$H/.local/bin/initio"; chmod +x "$H/.local/bin/initio"; }
 }
+cz_ignorar() {  # arquivos de DADOS do repo chezmoi nao podem virar arquivos da home: chezmoi re-add sobrescrevia o catalogo com a copia velha de ~/
+  local SRC="$1" f; for f in projetos-repos.tsv repos.tsv; do grep -qxF "$f" "$SRC/.chezmoiignore" 2>/dev/null || echo "$f" >> "$SRC/.chezmoiignore"; done
+}
+
 cmd_sync() {
   command -v chezmoi >/dev/null || { echo "chezmoi nao instalado (initio restore)"; return 1; }
   local SRC; SRC="$(czsrc)"
+  [ $DRY = 0 ] && cz_ignorar "$SRC"
+  if [ $DRY = 0 ]; then
+    say "0/5 perguntas (tudo agora; depois roda sozinho)"
+    pergunta_conda; sudo_prep
+  fi
   say "1/5 puxando mudancas de outras maquinas"
-  git -C "$SRC" pull -q --rebase --autostash 2>&1 | tail -3
+  # catalogo/arquivos locais viram commit ANTES do pull: autostash pode perder ou conflitar
+  git -C "$SRC" add -A >/dev/null 2>&1; git -C "$SRC" commit -q -m "initio sync (pre-pull) $(date +%F\ %H:%M) @$(hostname)" >/dev/null 2>&1 || true
+  if ! PULL_OUT=$(git -C "$SRC" pull -q --rebase 2>&1); then bad "pull falhou (nada foi perdido, seu commit local esta intacto):"; echo "$PULL_OUT" | tail -8; return 1; fi
   [ $DRY = 0 ] && self_install
   say "2/5 capturando esta maquina"; cmd_snapshot
   [ $DRY = 1 ] && { echo "[dry] pararia aqui (nao publica nem instala)"; return 0; }
@@ -500,6 +513,247 @@ cmd_perfil() {
   echo "ok: $t += $pkg em $p (rode 'initio sync' para publicar e instalar)"
 }
 
+# ================= repos de projetos: catalogar (url+branch) e clonar sob demanda =================
+projetos_dir() { echo "${PROJETOS_DIR:-$([ -d /mnt/b ] && echo /mnt/b/projetos || echo "$H/projetos")}"; }
+repos_url_limpa() { sed -E 's#https://[^@/]*@#https://#'; }
+repos_catalogar() {  # $1 = arquivo do catalogo; resto = pastas a varrer
+  local F="$1"; shift; local roots=("$@") r d n=0 novos=0
+  if [ ${#roots[@]} -eq 0 ]; then
+    for r in /mnt/c/Users/*/OneDrive*/Documentos/Projetos "$(projetos_dir)"; do [ -d "$r" ] && roots+=("$r"); done
+  fi
+  [ ${#roots[@]} -gt 0 ] || { echo "nenhuma pasta para varrer (passe uma: initio repos catalogar /caminho)"; return 1; }
+  touch "$F"; local tmp; tmp=$(mktemp)
+  for r in "${roots[@]}"; do
+    say "varrendo $r"
+    while IFS= read -r g; do
+      d="${g%/.git}"; local url br ahead nome owner
+      url=$(git -C "$d" remote get-url origin 2>/dev/null | repos_url_limpa)
+      if [ -z "$url" ]; then echo "   sem remote (nao catalogado): $d"; continue; fi
+      br=$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null || echo main)
+      ahead=$(git -C "$d" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+      nome=$(basename "$d")
+      # mesmo nome com url diferente: prefixa o dono para nao colidir
+      if awk -F'\t' -v n="$nome" -v u="$url" '$1==n && $2!=u{f=1} END{exit !f}' "$F" "$tmp" 2>/dev/null; then
+        owner=$(echo "$url" | sed -E 's#.*[:/]([^/]+)/[^/]+$#\1#'); nome="$owner-$nome"; fi
+      printf '%s\t%s\t%s\t%s\n' "$nome" "$url" "$br" "$d" >> "$tmp"
+      n=$((n+1))
+      if awk -F'\t' -v u="$url" '$2==u{f=1} END{exit !f}' "$F"; then echo "   ja catalogado: $nome ($br)"; else echo "   NOVO: $nome ($br)  $url"; novos=$((novos+1)); fi
+      [ "$ahead" != 0 ] && [ "$ahead" != "?" ] && echo "         ATENCAO: $ahead commit(s) nao enviados em $nome - faca push antes de depender so do catalogo"
+      [ "$ahead" = "?" ] && echo "         aviso: sem upstream configurado em $nome - confirme que o branch '$br' esta no GitHub"
+    done < <(find "$r" -maxdepth 3 \( -name node_modules -o -name _QUARENTENA -o -name _da-wsl -o -name .venv -o -name venv \) -prune -o -name .git -type d -print 2>/dev/null | sort)
+  done
+  [ $DRY = 1 ] && { echo "[dry] $n repos achados, $novos novos; nada gravado"; rm -f "$tmp"; return 0; }
+  # upsert por url (nunca remove); o ultimo achado vence
+  { cat "$F" "$tmp"; } | awk -F'\t' 'NF>=3{ if(!($2 in seen)) order[++c]=$2; seen[$2]=$0 } END{for(i=1;i<=c;i++) print seen[order[i]]}' | sort > "$F.new" && mv "$F.new" "$F"; rm -f "$tmp"
+  say "catalogo: $(wc -l < "$F") repos em $F ($novos novos). Publique com: initio sync"
+}
+repos_listar() {
+  local F="$1" nome url br _ dest st; [ -s "$F" ] || { echo "catalogo vazio (initio repos catalogar)"; return 0; }
+  printf '  %-26s %-9s %s\n' NOME STATUS URL
+  while IFS=$'\t' read -r nome url br _; do dest="$(projetos_dir)/$nome"
+    [ -d "$dest/.git" ] && st=clonado || st=falta; printf '  %-26s %-9s %s (%s)\n' "$nome" "$st" "$url" "$br"; done < "$F"
+  echo "  destino dos clones: $(projetos_dir)"
+}
+repos_restaurar_locais() {  # $1=nome (do catalogo) $2=destino (clone)  - traz da _QUARENTENA os ARQUIVOS ignorados pelo git (.env, .dev.vars...). Nunca sobrescreve. Pastas (build/cache) so sao listadas.
+  local nome="$1" dest="$2" F alt q src f n=0 dirs=() base; F="$(czsrc)/projetos-repos.tsv"
+  base=$(awk -F'\t' -v n="$nome" '$1==n{k=split($4,a,"/"); print a[k]}' "$F" 2>/dev/null | head -1)
+  src=""
+  for q in "$(dirname "$(projetos_dir)")/_QUARENTENA" /mnt/c/Users/*/OneDrive*/_QUARENTENA; do
+    for alt in "$nome" "$base"; do [ -n "$alt" ] || continue
+      local c; while IFS= read -r c; do [ -d "$c/.git" ] && { src="$c"; break; }; done < <(ls -d "$q/$alt"__* 2>/dev/null | sort -r)
+      [ -n "$src" ] && break
+    done
+    [ -n "$src" ] && break
+  done
+  [ -n "$src" ] && [ -d "$src/.git" ] || return 0
+  say "   arquivos locais (ignorados pelo git) da quarentena: $src"
+  while IFS= read -r f; do
+    case "$f" in node_modules/|*/node_modules/) continue;; */) dirs+=("$f"); continue;; esac
+    [ -e "$dest/$f" ] && continue
+    [ $DRY = 1 ] && { say "      [dry] copiaria $f"; continue; }
+    mkdir -p "$dest/$(dirname "$f")" && cp -p "$src/$f" "$dest/$f" && { say "      copiado: $f"; n=$((n+1)); }
+  done < <(git -C "$src" -c core.quotepath=off status --porcelain --ignored 2>/dev/null | grep '^!!' | sed 's/^!! //')
+  if [ ${#dirs[@]} -gt 0 ]; then
+    local lib=0 d2 outras=(); for d2 in "${dirs[@]}"; do case "$d2" in */lib/|lib/|*/dist/|dist/) lib=$((lib+1));; *) outras+=("$d2");; esac; done
+    [ ${#outras[@]} -gt 0 ] && say "      pastas ignoradas NAO copiadas (cache/estado local; ainda na quarentena): ${outras[*]:0:10}$([ ${#outras[@]} -gt 10 ] && echo " ... (+$(( ${#outras[@]} - 10 )))")"
+    [ $lib -gt 0 ] && say "      + $lib pasta(s) de build (lib/ dist/) nao copiadas (regeneradas pelo build)"
+  fi
+  [ $n -gt 0 ] && say "      $n arquivo(s) local(is) restaurado(s)"
+  return 0
+}
+repos_clonar() {  # $1 = catalogo; resto = nomes (vazio = todos os que faltam)
+  local F="$1"; shift; local nome url br _ dest feitos=0 falhou=0 pulou=0
+  [ -s "$F" ] || { echo "catalogo vazio (initio repos catalogar)"; return 1; }
+  gh auth status >/dev/null 2>&1 || echo "aviso: gh nao autenticado; repos privados vao falhar (gh auth login)"
+  mkdir -p "$(projetos_dir)"
+  while IFS=$'\t' read -r nome url br _; do
+    if [ $# -gt 0 ] && ! printf '%s\n' "$@" | grep -qx "$nome"; then continue; fi
+    dest="$(projetos_dir)/$nome"
+    [ -d "$dest/.git" ] && { say "   ja existe: $nome"; pulou=$((pulou+1)); repos_restaurar_locais "$nome" "$dest"; continue; }
+    [ -e "$dest" ] && { say "   PULADO: $dest existe e nao e repo git"; falhou=$((falhou+1)); continue; }
+    [ $DRY = 1 ] && { say "   [dry] clonaria $nome ($br) em $dest"; continue; }
+    if GIT_TERMINAL_PROMPT=0 git clone -q --branch "$br" "$url" "$dest" 2>>"$LOG"; then say "   ok: $nome ($br)"; feitos=$((feitos+1)); repos_restaurar_locais "$nome" "$dest"
+    else say "   FALHOU: $nome (sem permissao, repo removido ou branch '$br' inexistente?)"; falhou=$((falhou+1)); fi
+  done < "$F"
+  say "clonar: $feitos clonados, $pulou ja existiam, $falhou com problema (nunca faz push)"
+  [ $falhou -eq 0 ]
+}
+repos_norm() { sed -E 's#^git@([^:]+):#\1/#; s#^(ssh|https?|git)://([^@/]*@)?##; s#\.git$##; s#/$##' | tr 'A-Z' 'a-z'; }
+repos_duplicados() {  # [--profundo] [pasta...]  - SO LEITURA: acha o mesmo repo em varios lugares e diz qual esta mais atual
+  local fundo=0 roots=() a r; for a in "$@"; do case "$a" in --profundo) fundo=1;; *) roots+=("$a");; esac; done
+  if [ ${#roots[@]} -eq 0 ]; then
+    for r in /mnt/c/Users/*/OneDrive*/Documentos/Projetos /mnt/c/Users/*/OneDrive*/Documentos/New\ project "$(projetos_dir)" "$H"; do [ -d "$r" ] && roots+=("$r"); done
+  fi
+  local tab; tab=$(mktemp); local g d url br head dt ahead
+  say "procurando repos em ${#roots[@]} pasta(s)..."
+  for r in "${roots[@]}"; do
+    local md=4; [ "$r" = "$H" ] && md=5
+    while IFS= read -r g; do
+      d="${g%/.git}"; url=$(git -C "$d" remote get-url origin 2>/dev/null | repos_url_limpa | repos_norm); [ -n "$url" ] || continue
+      br=$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null || echo "-"); head=$(git -C "$d" rev-parse HEAD 2>/dev/null) || continue
+      dt=$(git -C "$d" log -1 --format=%cd --date=short 2>/dev/null); ahead=$(git -C "$d" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$url" "$d" "$br" "$head" "$dt" "$ahead" >> "$tab"
+    done < <(find "$r" -maxdepth $md \( -name node_modules -o -name _QUARENTENA -o -name .venv -o -name venv -o -name site-packages -o -name .cache -o -name .npm -o -name .nvm -o -name .cargo -o -name .rustup -o -name .sdkman -o -name .oh-my-zsh -o -name .goenv -o -name miniconda3 -o -name .local -o -name .config -o -name .bun -o -name .claude -o -name .codex \) -prune -o -name .git -type d -print 2>/dev/null)
+  done
+  sort -u -t$'\t' -k2,2 "$tab" -o "$tab"
+  local urls; urls=$(cut -f1 "$tab" | sort | uniq -d)
+  if [ -z "$urls" ]; then say "nenhum repo aparece em mais de um lugar (por URL do remote)."; else
+    local u; while IFS= read -r u; do
+      echo; echo "=== $u"; local members; members=$(awk -F'\t' -v u="$u" '$1==u' "$tab")
+      # referencia = o HEAD que contem mais dos outros; empate: commit mais novo
+      local best="" bestn=-1 bestdt="" bestok=0 p1 h1 d1 a1 n o ph okp
+      while IFS=$'\t' read -r _ p1 _ h1 d1 a1; do n=0; okp=0; [ "$a1" = 0 ] && okp=1
+        while IFS=$'\t' read -r _ o _ ph _; do git -C "$p1" merge-base --is-ancestor "$ph" "$h1" 2>/dev/null && n=$((n+1)); done <<< "$members"
+        # mais heads contidos; empate: o que ja esta enviado ao GitHub; empate: commit mais novo
+        if [ "$n" -gt "$bestn" ] || { [ "$n" -eq "$bestn" ] && { [ "$okp" -gt "$bestok" ] || { [ "$okp" -eq "$bestok" ] && [[ "$d1" > "$bestdt" ]]; }; }; }; then best="$p1"; bestn=$n; bestdt="$d1"; bestok=$okp; fi
+      done <<< "$members"
+      local bh; bh=$(awk -F'\t' -v p="$best" '$2==p{print $4}' "$tab")
+      while IFS=$'\t' read -r _ p1 br h1 d1 ahead; do local rel
+        if [ "$h1" = "$bh" ]; then rel="igual a referencia"
+        elif git -C "$best" merge-base --is-ancestor "$h1" "$bh" 2>/dev/null; then rel="ATRAS da referencia em $(git -C "$best" rev-list --count "$h1..$bh") commit(s)"
+        elif git -C "$p1" cat-file -e "$bh" 2>/dev/null; then rel="A FRENTE da referencia ($(git -C "$p1" rev-list --count "$bh..$h1") commit(s))"
+        else rel="DIVERGENTE da referencia (tem commits proprios)"; fi
+        [ "$p1" = "$best" ] && rel="REFERENCIA (mais atual)"
+        local extra=""; [ "$ahead" != 0 ] && [ "$ahead" != "?" ] && extra=" | $ahead nao enviado(s) ao GitHub"; [ "$ahead" = "?" ] && extra=" | sem upstream"
+        if [ $fundo = 1 ]; then local pend; pend=$(timeout 180 git -C "$p1" status --porcelain 2>/dev/null | wc -l); extra="$extra | $pend alteracao(oes) local(is)"; fi
+        printf '  %-60s %-10s %s %s%s\n' "$p1" "$br" "${h1:0:7}" "$d1" ""; printf '      -> %s%s\n' "$rel" "$extra"
+      done <<< "$members"
+    done <<< "$urls"
+  fi
+  # copias sem .git (snapshots) com o mesmo nome de um repo conhecido
+  echo; local nomes; nomes=$(awk -F'\t' '{n=split($2,a,"/"); print a[n]}' "$tab" | sort -u); local achou=0
+  for r in "${roots[@]}"; do
+    while IFS= read -r d; do [ -d "$d/.git" ] && continue
+      echo "$nomes" | grep -qx "$(basename "$d")" || continue
+      [ $achou = 0 ] && { echo "=== pastas SEM .git com nome de repo conhecido (provaveis copias/snapshots)"; achou=1; }
+      echo "  $d"
+      if [ $fundo = 1 ]; then local ref; ref=$(awk -F'\t' -v b="$(basename "$d")" '{n=split($2,a,"/"); if(a[n]==b){print $2; exit}}' "$tab")
+        [ -n "$ref" ] && echo "      diferencas contra $ref: $(timeout 180 diff -rq --exclude=.git --exclude=node_modules "$d" "$ref" 2>/dev/null | wc -l) arquivo(s)"; fi
+    done < <(find "$r" -maxdepth 2 -mindepth 1 -type d \( -name .git -o -name node_modules -o -name _QUARENTENA -o -name .local -o -name .config -o -name .cache \) -prune -o -type d -print 2>/dev/null)
+  done
+  [ $achou = 0 ] && echo "(nenhuma pasta sem .git com nome de repo conhecido)"
+  rm -f "$tab"; echo; say "so leitura: nada foi alterado; usa o que cada copia ja sabe do GitHub (sem fetch). --profundo tambem conta alteracoes locais e compara copias sem git (pode demorar no OneDrive)."
+}
+repos_reparar() {  # [--eol] pasta...  - restaura arquivos versionados apagados (copia incompleta); --eol tambem descarta modificacoes que sao SO fim de linha (CRLF/LF)
+  local eol=0 dirs=() a d n m lista; for a in "$@"; do case "$a" in --eol) eol=1;; *) dirs+=("${a%/}");; esac; done
+  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos reparar [--eol] <pasta>..."; return 1; }
+  for d in "${dirs[@]}"; do
+    echo "=== $d"
+    [ -d "$d/.git" ] || { say "   nao e repo git"; continue; }
+    say "   [1/3] procurando arquivos apagados..."; n=$(git -C "$d" ls-files -d | wc -l); m=0; lista=$(mktemp)
+    if [ $eol = 1 ]; then say "   [2/3] comparando conteudo ignorando fim de linha (OneDrive e lento: pode levar varios minutos, NAO esta travado)..."; repos_so_eol "$d" > "$lista"; m=$(grep -c . "$lista"); fi
+    [ "$n" = 0 ] && [ "$m" = 0 ] && { say "   nada a reparar"; rm -f "$lista"; continue; }
+    [ $DRY = 1 ] && { say "   [dry] restauraria $n apagado(s) e $m so-fim-de-linha"; rm -f "$lista"; continue; }
+    say "   [3/3] restaurando: $n apagado(s), $m so-fim-de-linha..."
+    [ "$n" -gt 0 ] && { git -C "$d" ls-files -z -d | xargs -0 git -C "$d" restore -- && say "   $n arquivo(s) apagado(s) restaurado(s)" || say "   FALHOU ao restaurar apagados"; }
+    [ "$m" -gt 0 ] && { tr '\n' '\0' < "$lista" | xargs -0 git -C "$d" restore -- && say "   $m arquivo(s) so-fim-de-linha descartado(s) (conteudo identico)" || say "   FALHOU ao descartar fim de linha"; }
+    rm -f "$lista"
+  done
+}
+repos_so_eol() {  # $1=repo -> lista arquivos versionados modificados cuja unica diferenca e fim de linha (nao staged)
+  local d="$1" real; real=$(git -C "$d" -c core.quotepath=off diff --ignore-cr-at-eol --numstat 2>/dev/null | cut -f3-)
+  git -C "$d" -c core.quotepath=off diff --name-only 2>/dev/null | grep -vxF -f <(printf '%s\n' "$real" | sed '/^$/d' | { cat; echo "__nada__"; })
+}
+repos_quarentena_de() {  # $1 = pasta -> imprime a quarentena no MESMO volume (mv rapido, sem copiar entre discos)
+  case "$1" in
+    /mnt/c/Users/*/OneDrive*/*) echo "$(echo "$1" | sed -E 's#^(/mnt/c/Users/[^/]+/OneDrive[^/]*)/.*#\1#')/_QUARENTENA";;
+    *) echo "$(dirname "$(projetos_dir)")/_QUARENTENA";;
+  esac
+}
+repos_mover() {  # $1=origem $2=destino. mv; se o Windows negar (pastas somente-leitura), tira o atributo R (so metadado) e tenta de novo. Erro real fica em REPOS_MV_ERR
+  REPOS_MV_ERR=$(mv -n "$1" "$2" 2>&1) && return 0
+  if [ -d "$1" ] && command -v cmd.exe >/dev/null 2>&1 && case "$1" in /mnt/*) true;; *) false;; esac; then
+    echo "   mv negado pelo Windows: removendo atributo somente-leitura das pastas (attrib -R, nao mexe em conteudo) e tentando de novo..."
+    cmd.exe /c "attrib -R /S /D \"$(wslpath -w "$1")\\*\"" >/dev/null 2>&1
+    REPOS_MV_ERR=$(mv -n "$1" "$2" 2>&1) && return 0
+  fi
+  return 1
+}
+repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --aplicar so mostra o veredito. Nunca apaga: MOVE para _QUARENTENA
+  local F="$1"; shift; local aplicar=0 fetch=0 okign=0 dirs=() a d
+  for a in "$@"; do case "$a" in --aplicar) aplicar=1;; --fetch) fetch=1;; --ok-ignorados) okign=1;; *) dirs+=("${a%/}");; esac; done
+  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos eliminar [--fetch] [--aplicar] [--ok-ignorados] <pasta>...   (sem --aplicar so mostra o que seria movido)"; return 1; }
+  [ -s "$F" ] || { echo "catalogo vazio: rode 'initio repos catalogar' antes (so elimino copia cujo repo esta catalogado)"; return 1; }
+  local ok=0 bloq=0
+  for d in "${dirs[@]}"; do
+    local motivos=() url urln br q nome
+    echo "=== $d"
+    if [ ! -d "$d/.git" ]; then echo "   BLOQUEADO: nao e repo git (snapshot/pasta comum): compare na mao, nao elimino"; bloq=$((bloq+1)); continue; fi
+    url=$(git -C "$d" remote get-url origin 2>/dev/null | repos_url_limpa)
+    [ -n "$url" ] || motivos+=("sem remote origin: nada garante que esta no GitHub")
+    urln=$(printf '%s' "$url" | repos_norm)
+    if [ -n "$url" ] && ! awk -F'\t' '{print $2}' "$F" | repos_norm | grep -qxF "$urln"; then motivos+=("repo nao esta no catalogo (initio repos catalogar)"); fi
+    [ $fetch = 1 ] && [ -n "$url" ] && { say "   [1/3] fetch no GitHub..."; timeout 90 git -C "$d" fetch -q --all 2>/dev/null || motivos+=("fetch falhou (rede/credencial): nao da para confirmar o remoto"); }
+    git -C "$d" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || motivos+=("branch atual sem upstream")
+    local ahead; ahead=$(git -C "$d" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0); [ "$ahead" = 0 ] || motivos+=("$ahead commit(s) nao enviados no branch atual")
+    # commits em QUALQUER branch local que nao existem em nenhum remoto
+    local b so=""; for b in $(git -C "$d" for-each-ref --format='%(refname:short)' refs/heads); do
+      [ "$(git -C "$d" rev-list --count "$b" --not --remotes 2>/dev/null || echo 1)" = 0 ] || so="$so $b"; done
+    [ -z "$so" ] || motivos+=("branch(es) com commits que nao estao em nenhum remoto:$so")
+    [ -z "$(git -C "$d" stash list 2>/dev/null)" ] || motivos+=("ha stash guardado")
+    git -C "$d" submodule status 2>/dev/null | grep -q . && motivos+=("tem submodulos (nao tratado)")
+    say "   [2/3] conferindo alteracoes locais (git status; no OneDrive pode levar minutos, nao esta travado)..."
+    local pend allst ign; allst=$(timeout 180 git -C "$d" -c core.quotepath=off status --porcelain --ignored 2>/dev/null); local rc=$?
+    pend=$(printf '%s\n' "$allst" | grep -v '^!!' | sed '/^$/d')
+    ign=$(printf '%s\n' "$allst" | grep '^!!' | grep -vE 'node_modules|\.venv|(^|/)venv/|/dist/|^!! dist/|(^|/)build/|\.cache|__pycache__|\.next/|\.nuxt/|coverage/|\.turbo|\.pytest_cache|\.mypy_cache|\.pnpm-store|\.parcel-cache|\.gradle|(^|/)target/' | sed '/^$/d')
+    [ $rc = 124 ] && motivos+=("git status estourou o tempo (OneDrive lento): tente de novo")
+    if [ -n "$pend" ]; then
+      local nd nu nm neol nreal
+      say "   [3/3] separando fim de linha de edicao real..."
+      nd=$(printf '%s\n' "$pend" | grep -c '^ D'); nu=$(printf '%s\n' "$pend" | grep -c '^??')
+      nm=$(printf '%s\n' "$pend" | grep -vc '^ D\|^??'); neol=$(repos_so_eol "$d" | grep -c .); nreal=$((nm-neol)); [ $nreal -lt 0 ] && nreal=0
+      [ "$nd" -gt 0 ] && motivos+=("$nd arquivo(s) versionado(s) apagado(s) (copia incompleta?): rode 'initio repos reparar $d'")
+      [ "$neol" -gt 0 ] && motivos+=("$neol arquivo(s) modificado(s) SO no fim de linha (CRLF/LF), conteudo identico: rode 'initio repos reparar --eol $d'")
+      if [ "$nreal" -gt 0 ]; then motivos+=("$nreal arquivo(s) com EDICAO REAL nao commitada (git -C '$d' diff --ignore-cr-at-eol --stat):"); git -C "$d" -c core.quotepath=off diff --ignore-cr-at-eol --numstat 2>/dev/null | head -8 | awk -F'\t' '{printf "        +%s -%s %s\n",$1,$2,$3}'; fi
+      if [ "$nu" -gt 0 ]; then motivos+=("$nu arquivo(s) NOVO(S) nao rastreado(s) (so existem aqui; commite ou ignore):"); git -C "$d" -c core.quotepath=off status --porcelain 2>/dev/null | grep '^??' | head -8 | sed 's/^/        /'; fi
+    fi
+    if [ -n "$ign" ] && [ $okign = 0 ]; then motivos+=("$(printf '%s\n' "$ign" | grep -c .) item(ns) IGNORADO(s) pelo .gitignore que so existem aqui (NAO estao no GitHub; ex.: .env, chaves, bancos). Copie/guarde o que importar e rode de novo com --ok-ignorados:"); printf '%s\n' "$ign" | head -12 | sed 's/^!! /        /'; fi
+    if [ ${#motivos[@]} -gt 0 ]; then bloq=$((bloq+1)); local m; for m in "${motivos[@]}"; do echo "   BLOQUEADO: $m"; done; continue; fi
+    br=$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null || echo "-"); q=$(repos_quarentena_de "$d"); nome="$(basename "$d")__$(date +%Y%m%d-%H%M%S)"
+    if [ $aplicar = 0 ]; then echo "   PODE ELIMINAR: tudo ja esta em $url ($br) -> moveria para $q/$nome   (confirme com --aplicar)"; ok=$((ok+1)); continue; fi
+    mkdir -p "$q" && repos_mover "$d" "$q/$nome" && { echo "   MOVIDO para $q/$nome   (recupera: initio repos clonar ou mova de volta)"; ok=$((ok+1)); } || {
+      echo "   FALHOU ao mover. Erro do sistema: ${REPOS_MV_ERR:-(vazio)}"
+      echo "   Verificando se a origem continua inteira..."
+      if [ -d "$d/.git" ] && [ ! -e "$q/$nome" ]; then echo "   origem intacta, nada foi movido. Causa provavel: arquivo aberto no Windows ou permissao (icacls/attrib); me mande o erro de: mv -n '$d' '$q/$nome'"
+      else echo "   ATENCAO: estado parcial! origem .git: $([ -d "$d/.git" ] && echo ok || echo AUSENTE); destino existe: $([ -e "$q/$nome" ] && echo sim || echo nao). NAO apague nada: confira $d e $q/$nome"; fi
+      bloq=$((bloq+1)); }
+  done
+  say "eliminar: $ok $([ $aplicar = 1 ] && echo movido\(s\) || echo elegivel\(is\)), $bloq bloqueado(s). Nada e apagado de vez: esvazie a quarentena voce mesmo quando quiser."
+  [ $bloq -eq 0 ]
+}
+cmd_repos() {
+  local sub="${1:-}"; shift || true; local F; F="$(czsrc)/projetos-repos.tsv"
+  case "$sub" in
+    catalogar) repos_catalogar "$F" "$@";;
+    duplicados) repos_duplicados "$@";;
+    listar) repos_listar "$F";;
+    clonar) repos_clonar "$F" "$@";;
+    reparar) repos_reparar "$@";;
+    eliminar) repos_eliminar "$F" "$@";;
+    *) echo "uso: initio repos catalogar [pasta...] | duplicados [--profundo] | listar | clonar [nome...] | reparar [--eol] <pasta>... | eliminar [--fetch] [--aplicar] <pasta>...   (destino: $(projetos_dir); mude com PROJETOS_DIR)";;
+  esac
+}
+
 ajuda() { cat <<'EOT'
 initio restore [cofre] [chave]     maquina nova: cofre + chave + dotfiles + repos
 initio <perfil>... | all | bootstrap   instala perfis (base sempre primeiro); initio list mostra
@@ -510,6 +764,11 @@ initio publicar-boot               espelha initio+perfis+install.sh no repo publ
 initio ssh-github                  cadastra/usa chave SSH no GitHub (cria uma com passphrase se preciso)
 initio doctor                      diagnostico
 initio perfil add <perfil> <apt|npm|pip|cargo|pipx> <pacote>
+initio repos catalogar [pasta...] registra url+branch dos repos achados (OneDrive\Projetos e B:\projetos por padrao)
+initio repos duplicados [--profundo]  acha o mesmo repo em varios lugares e diz qual esta mais atual (so leitura)
+initio repos reparar [--eol] <pasta>... restaura apagados (copia incompleta); --eol descarta modificacoes so de fim de linha
+initio repos eliminar [--aplicar] <pasta>...  confere se tudo esta no GitHub e MOVE a copia p/ _QUARENTENA (sem --aplicar so mostra)
+initio repos listar | clonar [nome...]   mostra o catalogo | clona so o que falta em B:\projetos (nunca faz push)
 EOT
 }
 
@@ -535,6 +794,7 @@ case "$cmd" in
   portar) cmd_portar;;
   doctor) cmd_doctor;;
   perfil) cmd_perfil "$@";;
+  repos) cmd_repos "$@";;
   all) for f in "$INITIO_HOME"/perfis/*.conf; do [ "$(basename "$f" .conf)" = extras ] || PERFIS+=("$(basename "$f" .conf)"); done; instalar_lista;;
   bootstrap) PERFIS=(base); instalar_lista;;
   *) PERFIS=("$cmd" "$@"); instalar_lista;;
