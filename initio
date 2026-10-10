@@ -867,7 +867,9 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
 
 # ===== resgate: o que so existe nesta maquina (stash, edicoes nao commitadas, arquivos ignorados) =====
 repos_resgate_itens() {  # $1=repo -> itens IGNORADOS pelo git que nao se regeneram (pasta termina em /), um por linha
-  git -C "$1" -c core.quotepath=off status --porcelain --ignored 2>/dev/null | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d'
+  git -C "$1" -c core.quotepath=off status --porcelain --ignored 2>/dev/null | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d' | while IFS= read -r it; do
+    case "$it" in */) [ -n "$(cd "$1" && find "${it%/}" -type f 2>/dev/null | grep -vE "$REPOS_REGEN" | head -1)" ] || continue;; esac
+    printf '%s\n' "$it"; done
 }
 repos_resgate_chave() { printf '%s-%s' "$(printf '%s' "$1" | md5sum | cut -c1-10)" "$(basename "$1")"; }
 repos_estado_hash() {  # $1=repo -> hash do estado local: HEAD, stash, edicoes, nao rastreados e ignorados relevantes (nome+tamanho+data)
