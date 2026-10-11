@@ -632,6 +632,20 @@ repo_roots() { if [ -n "${INITIO_REPO_ROOTS:-}" ]; then echo "$INITIO_REPO_ROOTS
 # itens ignorados pelo git que se regeneram (build, cache, dependencias): nunca contam como "so existe aqui"
 REPOS_REGEN='(^|/)(node_modules|\.venv|venv|dist|build|target|__pycache__|\.next|\.nuxt|coverage|\.turbo|\.pytest_cache|\.mypy_cache|\.pnpm-store|\.parcel-cache|\.gradle|\.cache|\.hypothesis|\.ruff_cache|\.output|\.wrangler|\.idea|python_modules|\.models|\.vite|\.eslintcache|[^/]*pycache[^/]*|\.test-[^/]*|logs|relatorio|\.venv[^/]*|venv[^/]*|graphify-out|htmlcov|\.test-results|\.features-gen|\.playwright-mcp|\.pnpm|\.yarn/cache|\.terraform|vendor/bundle)(/|$)|(^|/)infra/charts/[^/]+/charts(/|$)|(^|/)(Chart\.lock|coverage\.xml|\.test-report[^/]*\.json)$|\.coverage$|\.log$|(^|/)=[^/]*$|\.egg-info(/|$)|\.tsbuildinfo$|\.DS_Store$'
 repos_url_limpa() { sed -E 's#https://[^@/]*@#https://#'; }
+# do que esta ignorado pelo git, SO isto importa guardar (segredo/config local que faz falta e nao esta no GitHub). O resto (lockfile, .vscode, .claude/settings.local.json, midia, zip...) e descartavel: nao bloqueia e nao e salvo.
+# Para somar o seu: INITIO_IMPORTANTE_EXTRA='regex' em ~/.config/initio/env
+REPOS_IMPORTANTE='(^|/)(\.env[^/]*|\.envrc|\.dev\.vars|\.npmrc|\.netrc|\.pypirc|\.kube|\.aws|\.ssh|\.gnupg|secrets?|credentials?[^/]*|id_(rsa|ed25519|ecdsa)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore|tfvars|tfstate|sqlite3?|db))(/|$)|(^|/)service-account[^/]*\.json$|(^|/)[^/]*(secret|credential|token)[^/]*\.(json|ya?ml|txt)$'
+[ -n "${INITIO_IMPORTANTE_EXTRA:-}" ] && REPOS_IMPORTANTE="$REPOS_IMPORTANTE|$INITIO_IMPORTANTE_EXTRA"
+repos_ign_importante() {  # $1=repo; stdin=itens ignorados (pasta termina em /); imprime so os que importam (REPOS_IMPORTANTE). Pasta conta se algum arquivo dentro importa.
+  local it; while IFS= read -r it; do
+    [ -n "$it" ] || continue
+    case "$it" in
+      */) [ -n "$(cd "$1" && find "${it%/}" -type f 2>/dev/null | grep -vE "$REPOS_REGEN" | grep -E "$REPOS_IMPORTANTE" | head -1)" ] && printf '%s\n' "$it";;
+      *) printf '%s\n' "$it" | grep -qE "$REPOS_IMPORTANTE" && printf '%s\n' "$it";;
+    esac
+  done
+  return 0
+}
 repos_catalogar() {  # $1 = arquivo do catalogo; resto = pastas a varrer
   local F="$1"; shift; local roots=("$@") r d n=0 novos=0
   if [ ${#roots[@]} -eq 0 ]; then
@@ -810,9 +824,9 @@ repos_mover() {  # $1=origem $2=destino. mv; se o Windows negar (pastas somente-
   return 1
 }
 repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --aplicar so mostra o veredito. Nunca apaga: MOVE para _QUARENTENA
-  local F="$1"; shift; local aplicar=0 fetch=0 okign=0 okres=0 dirs=() a d
-  for a in "$@"; do case "$a" in --aplicar) aplicar=1;; --fetch) fetch=1;; --ok-ignorados) okign=1;; --ok-resgatado) okres=1;; *) dirs+=("${a%/}");; esac; done
-  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos eliminar [--fetch] [--aplicar] [--ok-ignorados] [--ok-resgatado] <pasta>...   (sem --aplicar so mostra o que seria movido)"; return 1; }
+  local F="$1"; shift; local aplicar=0 fetch=0 okign=0 okres=0 apagar=0 dirs=() a d
+  for a in "$@"; do case "$a" in --aplicar) aplicar=1;; --fetch) fetch=1;; --ok-ignorados) okign=1;; --ok-resgatado) okres=1;; --apagar) apagar=1;; *) dirs+=("${a%/}");; esac; done
+  [ ${#dirs[@]} -gt 0 ] || { echo "uso: initio repos eliminar [--fetch] [--aplicar] [--apagar] [--ok-ignorados] [--ok-resgatado] <pasta>...   (sem --aplicar so mostra; --apagar apaga de vez em vez de mover para _QUARENTENA)"; return 1; }
   [ -s "$F" ] || { echo "catalogo vazio: rode 'initio repos catalogar' antes (so elimino copia cujo repo esta catalogado)"; return 1; }
   local ok=0 bloq=0
   for d in "${dirs[@]}"; do
@@ -838,7 +852,10 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
     say "   [2/3] conferindo alteracoes locais (git status; em disco montado pode levar minutos, nao esta travado)..."
     local pend allst ign; allst=$(timeout 180 git -C "$d" -c core.quotepath=off status --porcelain --ignored 2>/dev/null); local rc=$?
     pend=$(printf '%s\n' "$allst" | grep -v '^!!' | sed '/^$/d')
-    ign=$(printf '%s\n' "$allst" | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d')
+    local ign_all desc; ign_all=$(printf '%s\n' "$allst" | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d')
+    ign=$(printf '%s\n' "$ign_all" | repos_ign_importante "$d")
+    desc=$(printf '%s\n' "$ign_all" | grep -vxFf <(printf '%s\n' "$ign") | sed '/^$/d')
+    [ -n "$desc" ] && say "   ignorados descartaveis (nao sao segredo/config; nao bloqueiam, nao sao salvos): $(printf '%s\n' "$desc" | grep -c .) -> $(printf '%s\n' "$desc" | head -6 | tr '\n' ' ')"
     [ $rc = 124 ] && motivos+=("git status estourou o tempo (disco lento): tente de novo")
     if [ -n "$pend" ] && [ $rescued = 0 ]; then
       local nd nu nm neol nreal
@@ -853,7 +870,8 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
     if [ -n "$ign" ] && [ $okign = 0 ] && [ $rescued = 0 ]; then motivos+=("$(printf '%s\n' "$ign" | grep -c .) item(ns) IGNORADO(s) pelo .gitignore que so existem aqui (NAO estao no GitHub; ex.: .env, chaves, bancos). Copie/guarde o que importar e rode de novo com --ok-ignorados:"); printf '%s\n' "$ign" | head -12 | sed 's/^/        /'; fi
     if [ ${#motivos[@]} -gt 0 ]; then bloq=$((bloq+1)); local m; for m in "${motivos[@]}"; do echo "   BLOQUEADO: $m"; done; continue; fi
     br=$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null || echo "-"); q=$(repos_quarentena_de "$d"); nome="$(basename "$d")__$(date +%Y%m%d-%H%M%S)"
-    if [ $aplicar = 0 ]; then echo "   PODE ELIMINAR: tudo ja esta em $url ($br) -> moveria para $q/$nome   (confirme com --aplicar)"; ok=$((ok+1)); continue; fi
+    if [ $aplicar = 0 ]; then if [ $apagar = 1 ]; then echo "   PODE ELIMINAR: tudo ja esta em $url ($br) -> APAGARIA de vez   (confirme com --aplicar)"; else echo "   PODE ELIMINAR: tudo ja esta em $url ($br) -> moveria para $q/$nome   (confirme com --aplicar)"; fi; ok=$((ok+1)); continue; fi
+    if [ $apagar = 1 ]; then rm -rf -- "$d" && { echo "   APAGADO: $d   (estava no GitHub; o que importava foi resgatado)"; ok=$((ok+1)); } || { echo "   FALHOU ao apagar $d (arquivo aberto/permissao?)"; bloq=$((bloq+1)); }; continue; fi
     mkdir -p "$q" && repos_mover "$d" "$q/$nome" && { echo "   MOVIDO para $q/$nome   (recupera: initio repos clonar ou mova de volta)"; ok=$((ok+1)); } || {
       echo "   FALHOU ao mover. Erro do sistema: ${REPOS_MV_ERR:-(vazio)}"
       echo "   Verificando se a origem continua inteira..."
@@ -861,15 +879,13 @@ repos_eliminar() {  # $1 = catalogo; [--aplicar] [--fetch] pasta...  - sem --apl
       else echo "   ATENCAO: estado parcial! origem .git: $([ -d "$d/.git" ] && echo ok || echo AUSENTE); destino existe: $([ -e "$q/$nome" ] && echo sim || echo nao). NAO apague nada: confira $d e $q/$nome"; fi
       bloq=$((bloq+1)); }
   done
-  say "eliminar: $ok $([ $aplicar = 1 ] && echo movido\(s\) || echo elegivel\(is\)), $bloq bloqueado(s). Nada e apagado de vez: esvazie a quarentena voce mesmo quando quiser."
+  say "eliminar: $ok $([ $aplicar = 1 ] && { [ $apagar = 1 ] && echo apagado\(s\) || echo movido\(s\); } || echo elegivel\(is\)), $bloq bloqueado(s). $([ $apagar = 1 ] && echo 'Apagado de vez.' || echo 'Nada e apagado de vez: esvazie a quarentena voce mesmo quando quiser.')"
   [ $bloq -eq 0 ]
 }
 
 # ===== resgate: o que so existe nesta maquina (stash, edicoes nao commitadas, arquivos ignorados) =====
-repos_resgate_itens() {  # $1=repo -> itens IGNORADOS pelo git que nao se regeneram (pasta termina em /), um por linha
-  git -C "$1" -c core.quotepath=off status --porcelain --ignored 2>/dev/null | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d' | while IFS= read -r it; do
-    case "$it" in */) [ -n "$(cd "$1" && find "${it%/}" -type f 2>/dev/null | grep -vE "$REPOS_REGEN" | head -1)" ] || continue;; esac
-    printf '%s\n' "$it"; done
+repos_resgate_itens() {  # $1=repo -> itens IGNORADOS pelo git que IMPORTAM (segredo/config local, ver REPOS_IMPORTANTE; pasta termina em /), um por linha
+  git -C "$1" -c core.quotepath=off status --porcelain --ignored 2>/dev/null | grep '^!!' | sed 's/^!! //' | grep -vE "$REPOS_REGEN" | sed '/^$/d' | repos_ign_importante "$1"
 }
 repos_resgate_chave() { printf '%s-%s' "$(printf '%s' "$1" | md5sum | cut -c1-10)" "$(basename "$1")"; }
 repos_estado_hash() {  # $1=repo -> hash do estado local: HEAD, stash, edicoes, nao rastreados e ignorados relevantes (nome+tamanho+data)
