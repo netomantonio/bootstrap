@@ -36,6 +36,7 @@ sudo_prep() {
 }
 
 # ================= repositorios apt de terceiros (docs oficiais, conferidos em 2026-10-07) =================
+em_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }  # Docker: na WSL vem do Docker Desktop; nativo so fora dela
 repo_docker() {
   S install -m 0755 -d /etc/apt/keyrings
   S curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && S chmod a+r /etc/apt/keyrings/docker.asc
@@ -89,9 +90,10 @@ pos_base() {  # zsh como shell padrao; identidade git vem do .gitconfig restaura
   done
   return 0
 }
-pos_devops() {  # docker: grupo + servico (so com systemd ativo)
+pos_devops() {  # docker nativo: grupo + servico (so fora da WSL, e so com systemd ativo)
+  if em_wsl; then echo "WSL: docker vem do Docker Desktop; nada a fazer"; return 0; fi
   S usermod -aG docker "$USER"
-  if [ -d /run/systemd/system ]; then S systemctl enable --now docker; else echo "systemd inativo: docker so sobe apos reiniciar a distro (wsl -t <nome>)"; fi
+  if [ -d /run/systemd/system ]; then S systemctl enable --now docker; else echo "systemd inativo: docker so sobe apos reiniciar a sessao"; fi
 }
 
 pos_go() {  # goenv (clone) + versoes do Go registradas em packages/goenv-versions.txt
@@ -157,6 +159,7 @@ instalar_perfil() {
   DESC=""; APT=(); REPOS=(); NPM=(); NODE=(); SDK=(); PIP=(); PIPX=(); CARGO=(); CONDA=(); CONFIGS=(); RUST=0; POS=""; PIP_FILE=""; REPO_PKGS=(); DOCKER_PKGS=()
   # shellcheck disable=SC1090
   . "$f"
+  if em_wsl; then local r0 _r=(); for r0 in "${REPOS[@]:-}"; do [ "$r0" = docker ] && { echo "   WSL: docker nativo pulado (usa Docker Desktop)"; continue; }; _r+=("$r0"); done; REPOS=("${_r[@]:-}"); fi
   say "=== perfil: $p - $DESC"
   if [ $DRY = 1 ]; then
     echo "   apt: ${APT[*]:-}  repos: ${REPOS[*]:-}"; echo "   node: ${NODE[*]:-}  npm: ${NPM[*]:-}  sdk: ${SDK[*]:-}"
@@ -600,10 +603,11 @@ cmd_doctor() {
   chk "chezmoi sem diferencas" "[ -z \"\$(chezmoi diff 2>/dev/null)\" ]"
   chk "pasta do cofre local" "[ -n \"\$(cofre_dir)\" ]"
   chk "systemd ativo" "[ -d /run/systemd/system ]"
+  chk "sem dockerd nativo na WSL (Docker Desktop)" "! em_wsl || ! dpkg -s docker-ce"
   chk "shell padrao zsh (login shell em /etc/passwd)" "[ \"\$(getent passwd $USER | cut -d: -f7 | xargs basename)\" = zsh ]"
   local t; [ -s "$H/.nvm/nvm.sh" ] && . "$H/.nvm/nvm.sh" >/dev/null 2>&1
   for t in node java python3 cargo conda docker; do command -v "$t" >/dev/null 2>&1 || [ -x "$H/miniconda3/bin/$t" ] && chk "$t no PATH" "command -v $t || [ -x $H/miniconda3/bin/$t ]" || echo "  --      $t nao instalado"; done
-  command -v docker >/dev/null && { if docker info >/dev/null 2>&1; then echo "  ok      docker responde"; n=$((n+1)); else echo "  --      docker nao responde (esperado se o docker vem do Windows; senao: wsl -t <distro> para ativar grupo/servico)"; fi; }
+  command -v docker >/dev/null && { if docker info >/dev/null 2>&1; then echo "  ok      docker responde"; n=$((n+1)); else echo "  --      docker nao responde (WSL: abra o Docker Desktop e ative a integracao com esta distro; fora da WSL: reinicie a sessao para ativar grupo/servico)"; fi; }
   [ -f "$(czsrc)/repos.tsv" ] && { local miss=0 rel; while IFS=$'\t' read -r rel _ _; do [ -d "$H/$rel/.git" ] || miss=$((miss+1)); done < "$(czsrc)/repos.tsv"; chk "repos do repos.tsv clonados (faltam $miss)" "[ $miss -eq 0 ]"; }
   chk "perfis instalados: $(cat "$STATE/instalados" 2>/dev/null | tr '\n' ' ')" "[ -s $STATE/instalados ]"
   echo "$n ok, $f falhas"
